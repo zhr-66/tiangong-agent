@@ -1,4 +1,4 @@
-# chenguang-agent-platform
+# chenguang-agent-
 
 #### 介绍
 《天宫医疗-智能体》集中于解决医疗领域的 Agent 业务构建。包括：
