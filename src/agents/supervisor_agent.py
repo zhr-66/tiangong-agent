@@ -3,10 +3,11 @@ from langgraph.checkpoint.redis import AsyncRedisSaver
 from langchain.agents import create_agent
 
 from src.agents.store_tools import save_memory, search_memory
+from src.agents.worker_tools import WORKER_TOOLS
 from src.infra.milvus_client import get_milvus_client_alias
 from src.infra.milvus_store import MilvusStore
 from src.infra.redis_cache import get_checkpointer_redis
-from src.core.config import get_settings
+from src.core.config import get_llm, get_settings
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -50,16 +51,34 @@ async def create_supervisor_agent():
     )
 
     # 4. 长期记忆工具
-    tools = [save_memory, search_memory]
+    tools = [save_memory, search_memory] + WORKER_TOOLS
 
-    # 4. 创建 Agent
+    # 5. 创建 Agent
     agent = create_agent(
-        model=settings.DEEPSEEK_MODEL,
+        model=get_llm(temperature=0.3),
         tools=tools,
         system_prompt=(
-            "你是天宫医疗的智能助手。"
-            "当用户提到重要的个人信息或病史时，使用 save_memory 工具记住它。"
-            "当需要回忆用户历史信息时，使用 search_memory 工具检索。"
+            "你是天宫医疗的智能总助手（Supervisor）。\n\n"
+            "你的核心职责：\n"
+            "1. 与患者/医生/运营人员进行多轮对话\n"
+            "2. 准确识别用户意图，将任务分派给合适的专项助手\n"
+            "3. 整合专项助手的结果，给出清晰、友好的最终回复\n"
+            "4. 主动收集必要信息（如症状描述不清时追问）\n"
+            "5. 管理对话上下文，保持对话连贯性\n\n"
+            "可调用的专项助手：\n"
+            "- call_inquiry_agent：智慧问诊（症状分诊、挂号建议）\n"
+            "- call_report_agent：报告解读（检验单、影像报告）\n"
+            "- call_drug_agent：药物咨询（用药推荐、药物交互、处方审查）\n"
+            "- call_knowledge_agent：医学知识问答（疾病科普、治疗方案）\n"
+            "- call_operation_agent：运营数据查询（仅限内部运营人员）\n\n"
+            "记忆工具：\n"
+            "- save_memory：将重要信息（病史、过敏史、用药偏好等）保存到长期记忆\n"
+            "- search_memory：从长期记忆中检索用户历史信息\n\n"
+            "工作原则：\n"
+            "- 优先从长期记忆中检索用户历史信息，避免重复询问\n"
+            "- 遇到复杂问题可以串联多个专项助手（先问诊再查药）\n"
+            "- 始终以患者安全为第一优先级\n"
+            "- 对话语气温和、专业、易懂"
         ),
         middleware=[
             SummarizationMiddleware( # 会话总结压缩

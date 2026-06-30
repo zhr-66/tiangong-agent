@@ -58,6 +58,18 @@ class Settings(BaseSettings):
     # 指定环境变量文件
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
+def get_llm(temperature: float = 0.3):
+    """返回 LLM 实例。Worker Agent 通过此函数获取统一配置的模型。"""
+    settings = get_settings()
+    from langchain_deepseek.chat_models import ChatDeepSeek
+    return ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        api_base=settings.BASE_URL_CHAT or "https://api.deepseek.com",
+        temperature=temperature,
+    )
+
+
 # 保存到内存缓存中。以后直接获取。
 @lru_cache  # lru 把对象实例保存到内存中。这是一种单例的实现
 def get_settings() -> Settings:
