@@ -37,15 +37,24 @@ uvicorn src.main:app --port 8080 --reload
 docker compose -f docker-compose.yml up -d
 
 ## 连接postgreSQL
-Host    localhost
-Port    5432
-User    medical
-pwd     medical123
-Database    medical_db
+Host：localhost  
+Port：5432  
+User：medical  
+pwd：medical123  
+Database：medical_db
 
 ## 连接Neo4j
-浏览器      http://localhost:7474
-Connect URL     bolt://localhost:7687 
-User            neo4j 
-Password        medical123
+浏览器：http://localhost:7474  
+Connect URL：bolt://localhost:7687  
+User：neo4j  
+Password：medical123
+
+## Redis 连接信息
+Host：localhost  
+Port：6379  
+Password：空（无密码）  
+Database：0
+访问地址：http://localhost:8001
+
+
 

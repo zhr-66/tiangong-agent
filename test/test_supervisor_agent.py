@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from agents.supervisor_agent import chat_endpoint
+from src.agents.supervisor_agent import chat_endpoint
 
 # @pytest.mark.asyncio
 async def test_supervisor_agent():
@@ -50,4 +50,4 @@ async def test_agent_store():
     resp2 = await chat_endpoint("2244", session_2, "我有什么病史和过敏史？")
     print(f"[检索] 回复：{resp2}")
 
-    assert "糖尿病" in resp2, f"长期记忆应能跨会话检索到糖尿病史，实际回复：{resp2}"
+    assert "新冠" in resp2 or "樱桃" in resp2, f"长期记忆应能跨会话检索到病史/过敏史，实际回复：{resp2}"

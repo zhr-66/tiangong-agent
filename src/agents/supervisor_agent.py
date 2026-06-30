@@ -1,13 +1,12 @@
 from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.checkpoint.redis import AsyncRedisSaver
 from langchain.agents import create_agent
-from langchain_deepseek.chat_models import ChatDeepSeek
-from pywin.framework.toolmenu import tools
 
-from agents.store_tools import save_memory, search_memory
-from infra.milvus_client import get_milvus_client_alias
-from infra.milvus_store import MilvusStore
+from src.agents.store_tools import save_memory, search_memory
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.milvus_store import MilvusStore
 from src.infra.redis_cache import get_checkpointer_redis
+from src.core.config import get_settings
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,6 +27,8 @@ def _get_embedding_model():
 
 # 创建出 监督 Agent
 async def create_supervisor_agent():
+    settings = get_settings()
+
     # 1. 复用项目已有的 checkpointer 专用 Redis 客户端（bytes 模式）
     redis_client = get_checkpointer_redis()
 
@@ -53,7 +54,7 @@ async def create_supervisor_agent():
 
     # 4. 创建 Agent
     agent = create_agent(
-        model="deepseek-chat",
+        model=settings.DEEPSEEK_MODEL,
         tools=tools,
         system_prompt=(
             "你是天宫医疗的智能助手。"
@@ -62,13 +63,13 @@ async def create_supervisor_agent():
         ),
         middleware=[
             SummarizationMiddleware( # 会话总结压缩
-                model="deepseek-chat",
+                model=settings.DEEPSEEK_MODEL,
                 trigger=[
                     ("tokens", 4000),  # token数达到4k时触发
-                    ("messages", 6),  # 或消息数达到 4条时触发
+                    ("messages", 6),  # 或消息数达到 6 条时触发
                     # ("fraction", 0.8)  # 或80%消息时触发
                 ],
-                keep=("messages", 6),  # 摘要后保留最近 4 条消息
+                keep=("messages", 6),  # 摘要后保留最近 6 条消息
             )
         ],
         checkpointer=checkpointer, # 短期记忆. agent chat ui（禁用你配置 checkpointer）
@@ -94,8 +95,10 @@ async def chat_endpoint(user_id: str, session_id: str, message: str):
     # 使用单例，不重复初始化。获取 agent
     agent = await get_supervisor_agent()
 
-    # thread_id 用来区分不同会话。  用户id:会话id:日期（前端传来一个会话id）
-    config = {"configurable": {"thread_id": f"{user_id}:{session_id}"}}
+    # thread_id 用来区分不同会话。格式：用户id:会话id:日期
+    # 加日期便于后续按天清理过期会话
+    from datetime import date
+    config = {"configurable": {"thread_id": f"{user_id}:{session_id}:{date.today().isoformat()}"}}
 
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": message}]},
