@@ -33,3 +33,19 @@ uvicorn src.main:app --port 8080 --reload
 ## env配置
 把 .env.example 复制一份 叫 .env ，修改为自己的信息即可
 
+## 启动docker
+docker compose -f docker-compose.yml up -d
+
+## 连接postgreSQL
+Host    localhost
+Port    5432
+User    medical
+pwd     medical123
+Database    medical_db
+
+## 连接Neo4j
+浏览器      http://localhost:7474
+Connect URL     bolt://localhost:7687 
+User            neo4j 
+Password        medical123
+
