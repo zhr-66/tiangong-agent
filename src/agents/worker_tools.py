@@ -1,4 +1,4 @@
-﻿# src/agents/worker_tools.py
+# src/agents/worker_tools.py
 
 from dataclasses import dataclass
 
@@ -117,17 +117,17 @@ async def call_drug_agent(message: str) -> str:
 
 
 @tool
-async def call_knowledge_agent(message: str) -> str:
+async def call_knowledge_agent(message: str, runtime: ToolRuntime) -> str:
     """
     调用知识问答Agent，回答医学知识类问题。
     适用场景：询问疾病知识、治疗方案、医学术语解释、文献检索时。
     message: 患者或医生的医学知识问题。
     """
-    agent = get_knowledge_agent()
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": message}]}
-    )
-    return result["messages"][-1].content
+    user_id, session_id = _parse_thread_id(runtime)
+    logger.info("工具调用 call_knowledge_agent: session={} message={}", session_id, message[:50])
+
+    agent = await get_knowledge_agent()
+    return await agent.query(message, user_id=user_id, session_id=session_id)
 
 
 @tool
@@ -152,4 +152,3 @@ WORKER_TOOLS = [
     call_knowledge_agent,
     call_operation_agent,
 ]
-

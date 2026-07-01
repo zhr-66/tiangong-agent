@@ -1,0 +1,2905 @@
+携带了全量基础能力
+
+
+[图片]
+1. 实现功能
+暂时无法在飞书文档外展示此内容
+
+
+Step 1：Prompt 模板
+1. 所有提示词
+创建：src/agents/knowledge/prompts.py
+所有 LLM 调用的 Prompt 集中管理。
+暂时无法在飞书文档外展示此内容
+
+2. 代码实现
+# src/agents/knowledge/prompts.py
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. Query 理解层
+# ═══════════════════════════════════════════════════════════════════════════
+
+QUERY_REWRITE_PROMPT = """你是医学检索查询改写专家。将用户的口语化提问改写为适合检索的规范化查询。
+
+用户角色：{role}
+用户原始问题：{question}
+
+改写规则：
+1. 口语词替换为医学标准术语（如"肚子疼"→"腹痛"，"血压高"→"高血压"）
+2. 补充隐含的医学上下文（如"能一起吃吗"→"药物相互作用/配伍禁忌"）
+3. 如果问题包含多个子问题，拆分为独立的检索查询
+4. 保留患者上下文信息（合并症、过敏史等）
+
+以 JSON 格式输出：
+{{"queries": ["改写后的查询1", "改写后的查询2"], "intent": "clinical_decision|prescription_review|drug_substitute|knowledge_qa|operation_data"}}
+
+只输出 JSON，不要解释。"""
+
+HYDE_PROMPT = """你是医学知识专家。请根据以下问题，写一段假设性的回答（约100-200字），作为检索的参考文本。
+不需要完全准确，目的是生成一段与正确答案语义相近的文本，用于提升向量检索的召回率。
+
+问题：{question}
+
+直接输出假设性回答，不要加前缀或解释。"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. 文档 RAG
+# ═══════════════════════════════════════════════════════════════════════════
+
+DOC_QA_PROMPT = """你是天宫医疗的知识问答助手，请根据以下检索到的文档片段回答用户问题。
+
+用户角色：{role}
+用户问题：{question}
+
+检索到的文档片段：
+{context}
+
+要求：
+1. 只根据上述文档内容回答，不要编造信息
+2. 回答中必须内联标注引用来源，格式：【来源：文档名称, 第X页】
+3. 如果文档内容不足以回答问题，明确告知"当前知识库中未找到相关信息"
+4. 根据用户角色调整回答深度：医生→专业术语+循证依据；药师→侧重用药安全；其他→通俗易懂
+
+直接输出回答内容。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. GraphRAG
+# ═══════════════════════════════════════════════════════════════════════════
+
+ENTITY_EXTRACT_PROMPT = """从用户问题中提取医学实体（疾病名、症状名、药物名、科室名、检查项目名）。
+
+用户问题：{question}
+
+以 JSON 格式输出：
+{{
+  "diseases": ["疾病名1"],
+  "symptoms": ["症状名1"],
+  "drugs": ["药物名1"],
+  "departments": ["科室名1"],
+  "checks": ["检查项目1"]
+}}
+
+没有的类别填空列表。只输出 JSON，不要解释。"""
+
+
+NL2CYPHER_PROMPT = """你是 Neo4j Cypher 查询专家。根据用户问题和图谱 Schema 生成 Cypher 查询。
+
+## 图谱 Schema
+
+节点类型：
+- Disease（疾病）：属性 name, description, cause, prevent, cure_way, cured_prob, easy_get, cost_money
+- Symptom（症状）：属性 name
+- Drug（药物）：属性 name
+- Department（科室）：属性 name
+- Check（检查项目）：属性 name
+- Food（食物）：属性 name
+
+关系类型：
+- (Disease)-[:HAS_SYMPTOM]->(Symptom)      疾病的症状
+- (Disease)-[:BELONGS_TO]->(Department)     疾病所属科室
+- (Disease)-[:COMMON_DRUG]->(Drug)          常用药
+- (Disease)-[:RECOMMEND_DRUG]->(Drug)       推荐药
+- (Disease)-[:NEED_CHECK]->(Check)          需要的检查
+- (Disease)-[:DO_EAT]->(Food)               宜吃食物
+- (Disease)-[:NO_EAT]->(Food)               忌吃食物
+- (Disease)-[:ACOMPANY_WITH]->(Disease)     并发症
+
+## 规则
+1. 只使用上述 Schema 中存在的节点和关系类型
+2. 查询深度最多 3 跳
+3. 返回结果用 LIMIT 限制，最多 20 条
+4. 返回有意义的字段（name、属性），不要只返回节点 ID
+
+用户问题：{question}
+已提取的实体：{entities}
+
+只输出 Cypher 查询语句，不要解释。"""
+
+
+GRAPH_QA_PROMPT = """你是天宫医疗的知识问答助手。根据知识图谱查询结果回答用户问题。
+
+用户角色：{role}
+用户问题：{question}
+
+图谱查询结果：
+{graph_result}
+
+要求：
+1. 用自然语言整合查询结果，条理清晰
+2. 如果结果涉及多个实体，用列表或分类展示
+3. 标注信息来源为"医学知识图谱"
+4. 如果查询结果为空，告知用户"知识图谱中未找到相关信息"
+
+直接输出回答内容。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. NL2SQL
+# ═══════════════════════════════════════════════════════════════════════════
+
+NL2SQL_PROMPT = """你是 SQL 查询专家。根据用户问题和数据库表结构生成 PostgreSQL 查询。
+
+## 表结构
+
+departments（科室）:
+  id, name, created_at
+
+diseases（疾病）:
+  id, name, department_id(FK→departments), description, cause, cure_way, cured_prob, easy_get, cost_money, created_at
+
+symptoms（症状）:
+  id, name, created_at
+
+drugs（药品）:
+  id, name, category, is_otc, stock_quantity, price, expire_date, created_at
+
+consultations（问诊记录）:
+  id, patient_id(FK→patients), department_id(FK→departments), chief_complaint, diagnosis, urgency_level, session_id, created_at
+
+disease_symptoms（疾病-症状关联）:
+  id, disease_id(FK→diseases), symptom_id(FK→symptoms)
+
+disease_drugs（疾病-药品关联）:
+  id, disease_id(FK→diseases), drug_id(FK→drugs), relation_type('common'/'recommend')
+
+## 安全规则
+1. 只允许 SELECT 语句
+2. 禁止查询 patients 表的 phone、id_card 字段
+3. 必须包含 LIMIT，最大 100
+4. 不要使用子查询嵌套超过 2 层
+
+用户问题：{question}
+
+只输出 SQL 语句，不要解释。"""
+
+
+SQL_QA_PROMPT = """你是天宫医疗的数据分析助手。根据 SQL 查询结果回答用户问题。
+
+用户问题：{question}
+
+执行的 SQL：
+{sql}
+
+查询结果：
+{result}
+
+要求：
+1. 用自然语言总结查询结果，突出关键数据
+2. 如果是统计数据，可以用排名或对比的方式展示
+3. 标注数据来源为"运营数据库"
+4. 如果结果为空，说明"未查询到相关数据"
+
+直接输出回答内容。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. 多通道融合 + 幻觉检测
+# ═══════════════════════════════════════════════════════════════════════════
+
+FUSION_PROMPT = """你是天宫医疗的知识问答助手。请综合以下多个来源的检索结果，回答用户问题。
+
+用户角色：{role}
+用户问题：{question}
+
+{sources}
+
+要求：
+1. 综合所有来源的信息，给出完整、准确的回答
+2. 如果不同来源的信息存在冲突，明确指出冲突点并给出建议
+3. 每条关键信息必须内联标注来源，格式：【来源：xxx】
+4. 根据用户角色调整回答深度和风格
+5. 如果所有来源都未找到相关信息，明确告知
+
+直接输出回答内容。"""
+
+
+HALLUCINATION_CHECK_PROMPT = """判断以下回答是否完全基于提供的检索结果，有无编造信息。
+
+用户问题：{question}
+
+检索结果摘要：
+{evidence}
+
+系统回答：
+{answer}
+
+逐条检查回答中的事实性陈述，判断每条是否有检索结果支撑。
+
+以 JSON 格式输出：
+{{"is_grounded": true/false, "unsupported_claims": ["无依据的陈述1"], "confidence": 0.0-1.0}}
+
+只输出 JSON，不要解释。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. 处方审核（药剂科场景）
+# ═══════════════════════════════════════════════════════════════════════════
+
+PRESCRIPTION_PARSE_PROMPT = """从用户输入中提取处方信息。
+
+用户输入：{question}
+
+以 JSON 格式输出：
+{{
+  "drugs": [
+    {{"name": "药品名", "dosage": "剂量", "frequency": "频次", "route": "给药途径"}}
+  ],
+  "patient_info": {{
+    "allergies": ["过敏药物"],
+    "diseases": ["基础疾病"],
+    "age": null,
+    "gender": null
+  }}
+}}
+
+尽可能提取，缺失的字段填 null 或空列表。只输出 JSON，不要解释。"""
+
+
+PRESCRIPTION_REPORT_PROMPT = """你是天宫医疗的处方审核助手。根据以下校验结果生成处方审核报告。
+
+处方信息：
+{prescription}
+
+校验结果：
+{check_results}
+
+生成格式：
+## 处方审核报告
+
+### 总体结论：通过 / 需关注 / 建议拦截
+
+### 逐项审核
+（对每个药品列出：剂量校验、配伍校验、过敏校验结果）
+
+### 风险项
+- 🔴 严重风险：（配伍禁忌、过敏冲突）
+- 🟡 中等风险：（剂量偏高、重复用药）
+
+### 建议
+（替代方案、调整建议）
+
+每条结论必须标注依据来源。"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. 查询路由
+# ═══════════════════════════════════════════════════════════════════════════
+
+ROUTE_PROMPT = """判断用户问题应该使用哪种检索方式。
+
+问题类型：
+- doc_rag：问文档内容、指南、说明书、制度、规范、操作流程
+- graph_rag：问实体间关系（疾病和症状/药物/科室的关系），需要多跳推理
+- nl2sql：问统计数据、数量、排名、趋势、库存
+- multi：需要同时查多个来源才能回答的复杂问题
+- prescription：处方审核、用药安全校验
+
+用户问题：{question}
+
+以 JSON 格式输出：
+{{"route": "doc_rag/graph_rag/nl2sql/multi/prescription", "reason": "简要原因"}}
+
+只输出 JSON，不要解释。"""
+
+
+3. 关键设计：
+- 角色感知：DOC_QA_PROMPT、GRAPH_QA_PROMPT、FUSION_PROMPT 都有 {role} 占位符，医生→专业术语，药师→用药安全，患者→通俗语言。
+- 结构化输出：QUERY_REWRITE_PROMPT、HALLUCINATION_CHECK_PROMPT、PRESCRIPTION_PARSE_PROMPT 要求 LLM 输出 JSON，方便程序解析。
+- Schema 约束：NL2CYPHER_PROMPT 完整列出图谱 Schema（6 类节点、8 类关系），NL2SQL_PROMPT 列出表结构但故意省略敏感字段。
+
+
+Step 2：Query 改写
+1. 功能解释
+新建 src/agents/knowledge/query_rewriter.py
+用户提问往往口语化（"肚子疼吃啥药"），直接检索效果差。
+Query 改写做两件事：术语标准化 + 子问题拆分。 
+
+2. 代码实现
+# src/agents/knowledge/query_rewriter.py
+
+from __future__ import annotations
+import json
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+
+from src.agents.knowledge.prompts import QUERY_REWRITE_PROMPT
+
+
+async def rewrite_query(
+    question: str,
+    llm: BaseChatModel,
+    role: str = "patient",
+) -> dict:
+    """
+    Query 改写：口语 → 医学术语，复杂问题拆分为子查询。
+    返回 {"queries": [...], "intent": "..."}
+    """
+    prompt = QUERY_REWRITE_PROMPT.format(question=question, role=role)
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        result = json.loads(content)
+        if "queries" not in result or not result["queries"]:
+            result["queries"] = [question]
+        if "intent" not in result:
+            result["intent"] = "knowledge_qa"
+        return result
+    except Exception as e:
+        logger.warning(f"Query 改写失败: {e}")
+        return {"queries": [question], "intent": "knowledge_qa"}
+
+- 解析失败时返回原始问题，不中断流程
+- 同时输出 intent 字段（clinical_decision临床决策 / prescription_review处方审核 / knowledge_qa知识问答 等），供上层路由
+
+
+
+Step 3：HyDE 假设文档生成
+1. 功能解释
+新建 src/agents/knowledge/hyde.py
+HyDE（Hypothetical Document Embeddings）：先让 LLM 生成一段假设性回答，再用假设回答的向量去检索。因为假设回答和真实文档的语义更接近，召回率显著高于直接用问题向量检索。
+
+2. 代码实现
+# src/agents/knowledge/hyde.py
+
+from __future__ import annotations
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+
+from src.agents.knowledge.prompts import HYDE_PROMPT
+
+
+async def generate_hyde_embedding(
+    question: str,
+    llm: BaseChatModel,
+    embedding_model: Embeddings,
+) -> list[float]:
+    """
+    HyDE（Hypothetical Document Embeddings）：
+    1. LLM 生成假设性回答
+    2. 对假设回答做向量化
+    3. 用假设回答的向量去检索（比原始问题的向量召回率更高）
+    """
+    prompt = HYDE_PROMPT.format(question=question)
+    try:
+        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        hypothetical_doc = response.content.strip()
+        logger.debug(f"HyDE 假设文档: {hypothetical_doc[:100]}...")
+        return await embedding_model.aembed_query(hypothetical_doc)
+    except Exception as e:
+        logger.warning(f"HyDE 生成失败，回退到原始查询向量: {e}")
+        return await embedding_model.aembed_query(question)
+
+Step 4：Reranker 精排
+1. 功能解释
+新建 src/agents/knowledge/reranker.py
+向量检索的 top_k 结果按余弦距离排序，但距离排序不等于语义相关性排序。
+Reranker 用交叉编码器对 query-document 对做精排，显著提升精度。
+
+2. 代码实现
+# src/agents/knowledge/reranker.py
+
+from __future__ import annotations
+from loguru import logger
+
+from src.core.config import get_settings
+
+settings = get_settings()
+
+
+async def rerank_docs(
+    query: str,
+    documents: list[dict],
+    top_k: int = 3,
+) -> list[dict]:
+    """
+    使用 DashScope Reranker 对检索结果精排。
+    输入：query + 粗检索结果列表（每个元素含 "text" 字段）
+    输出：按相关性重排后的 top_k 结果
+    """
+    if not documents:
+        return []
+
+    if len(documents) <= top_k:
+        return documents
+
+    try:
+        import dashscope
+        from dashscope import TextReRank
+
+        dashscope.api_key = settings.DASHSCOPE_API_KEY
+
+        texts = [doc.get("text", "") for doc in documents]
+        response = TextReRank.call(
+            model="qwen3-rerank",
+            query=query,
+            documents=texts,
+            top_n=top_k,
+            return_documents=False,
+        )
+
+        if response.status_code != 200:
+            logger.warning(f"Reranker 调用失败: {response.message}")
+            return documents[:top_k]
+
+        reranked = []
+        for item in response.output.results:
+            idx = item.index
+            doc = documents[idx].copy()
+            doc["rerank_score"] = item.relevance_score
+            reranked.append(doc)
+
+        return reranked
+
+    except ImportError:
+        logger.warning("dashscope 未安装，回退到向量距离排序")
+        return documents[:top_k]
+    except Exception as e:
+        logger.warning(f"Reranker 异常，回退到向量距离排序: {e}")
+        return documents[:top_k]
+
+Step 5：文档 RAG（搜 向量库）
+新建 src/agents/knowledge/doc_rag.py
+
+1. 功能解释
+文档 RAG 是最核心的检索通道。
+完整流程：HyDE 生成假设向量 → Milvus 粗检索 20 条 → Reranker 精排取 top 5 → LLM 生成回答。
+
+拆分为两个函数：
+暂时无法在飞书文档外展示此内容
+
+2. 代码实现
+# src/agents/knowledge/doc_rag.py
+
+from __future__ import annotations
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+from pymilvus import MilvusClient
+
+from src.agents.knowledge.prompts import DOC_QA_PROMPT
+
+COLLECTION_NAME = "knowledge_docs"
+
+
+async def search_docs_raw(
+    question: str,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+    top_k: int = 20,
+    rerank_top_k: int = 5,
+    doc_type: str | None = None,
+    llm: BaseChatModel | None = None,
+    use_hyde: bool = False,
+) -> list[dict]:
+    """
+    文档向量检索，返回原始检索结果列表。
+    支持 HyDE 增强检索和 Reranker 精排。
+    """
+    if use_hyde and llm is not None:
+        from src.agents.knowledge.hyde import generate_hyde_embedding
+        query_vec = await generate_hyde_embedding(question, llm, embedding_model)
+    else:
+        query_vec = await embedding_model.aembed_query(question)
+
+    search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
+    filter_expr = f'doc_type == "{doc_type}"' if doc_type else None
+
+    try:
+        results = milvus_client.search(
+            collection_name=COLLECTION_NAME,
+            data=[query_vec],
+            limit=top_k,
+            output_fields=["doc_name", "doc_type", "page_number", "chunk_index", "text"],
+            search_params=search_params,
+            filter=filter_expr,
+        )
+    except Exception as e:
+        logger.warning(f"文档检索失败: {e}")
+        return []
+
+    if not results or not results[0]:
+        return []
+
+    hits = [
+        {**hit["entity"], "score": hit.get("distance", 0.0)}
+        for hit in results[0]
+    ]
+
+    from src.agents.knowledge.reranker import rerank_docs
+    reranked = await rerank_docs(question, hits, top_k=rerank_top_k)
+    return reranked
+
+
+def format_doc_context(hits: list[dict]) -> str:
+    """将检索结果格式化为 LLM 可读的上下文字符串。
+       统一格式: 片段1 [文档名, 第X页]: 内容... 。
+    """
+    if not hits:
+        return ""
+    parts = []
+    for i, hit in enumerate(hits, 1):
+        source = f"[{hit['doc_name']}, 第{hit.get('page_number', '?')}页]"
+        parts.append(f"片段{i} {source}:\n{hit['text']}")
+    return "\n\n---\n\n".join(parts)
+
+
+async def search_docs(
+    question: str,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+    llm: BaseChatModel,
+    top_k: int = 20,
+    rerank_top_k: int = 5,
+    doc_type: str | None = None,
+    role: str = "patient",
+    use_hyde: bool = True,
+) -> str:
+    """文档 RAG 检索 + Reranker 精排 + HyDE 增强 + 生成回答。"""
+    hits = await search_docs_raw(
+        question, embedding_model, milvus_client,
+        top_k=top_k, rerank_top_k=rerank_top_k, doc_type=doc_type,
+        llm=llm, use_hyde=use_hyde,
+    )
+    if not hits:
+        return "当前知识库中未找到与您问题相关的文档内容。"
+
+    context = format_doc_context(hits)
+    prompt = DOC_QA_PROMPT.format(question=question, context=context, role=role)
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    return response.content
+
+Step 6：GraphRAG（搜 图库 Neo4j）
+1. 功能解释
+新建 src/agents/knowledge/graph_rag.py
+用于结构化关系推理（"糖尿病的常用药有哪些"）。三步流水线 + Cypher 容错重试：
+[图片]
+同样拆分为 search_graph_raw（返回原始记录）和 search_graph（返回最终回答）。
+
+
+2. 代码实现
+# src/agents/knowledge/graph_rag.py
+
+from __future__ import annotations
+import json
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from neo4j import AsyncDriver
+
+from src.agents.knowledge.prompts import (
+    ENTITY_EXTRACT_PROMPT, NL2CYPHER_PROMPT, GRAPH_QA_PROMPT,
+)
+
+MAX_CYPHER_RETRIES = 2
+
+
+async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
+    prompt = ENTITY_EXTRACT_PROMPT.format(question=question)
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"实体提取失败: {e}")
+        return {"diseases": [], "symptoms": [], "drugs": [], "departments": [], "checks": []}
+
+
+async def _generate_cypher(
+    question: str, entities: dict, llm: BaseChatModel, error_hint: str = "",
+) -> str:
+    extra = ""
+    if error_hint:
+        extra = f"\n\n上一次生成的 Cypher 执行报错：{error_hint}\n请修正后重新生成。"
+    prompt = NL2CYPHER_PROMPT.format(
+        question=question,
+        entities=json.dumps(entities, ensure_ascii=False),
+    ) + extra
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    cypher = response.content.strip()
+    if "```" in cypher:
+        cypher = cypher.split("```")[1].lstrip("cypher").strip()
+    return cypher
+
+
+async def _execute_cypher(cypher: str, neo4j_driver: AsyncDriver) -> list[dict]:
+    if not cypher:
+        return []
+    async with neo4j_driver.session() as session:
+        result = await session.run(cypher)
+        return await result.data()
+
+
+async def search_graph_raw(
+    question: str,
+    neo4j_driver: AsyncDriver,
+    llm: BaseChatModel,
+) -> list[dict]:
+    """GraphRAG 检索，返回原始图谱查询结果（不经过 LLM 生成）。"""
+    entities = await _extract_entities(question, llm)
+    logger.info(f"GraphRAG 实体提取: {entities}")
+
+    error_hint = ""
+    for attempt in range(MAX_CYPHER_RETRIES + 1):
+        cypher = await _generate_cypher(question, entities, llm, error_hint)
+        logger.info(f"GraphRAG Cypher (attempt {attempt + 1}): {cypher}")
+        try:
+            records = await _execute_cypher(cypher, neo4j_driver)
+            return records[:20]
+        except Exception as e:
+            error_hint = str(e)
+            logger.warning(f"Cypher 执行失败 (attempt {attempt + 1}): {e}")
+            if attempt == MAX_CYPHER_RETRIES:
+                return []
+    return []
+
+
+async def search_graph(
+    question: str,
+    neo4j_driver: AsyncDriver,
+    llm: BaseChatModel,
+    role: str = "patient",
+) -> str:
+    """GraphRAG 完整流程：实体提取 → NL2Cypher（带重试）→ LLM 整合。"""
+    records = await search_graph_raw(question, neo4j_driver, llm)
+
+    if not records:
+        return "知识图谱中未找到与您问题相关的信息。"
+
+    graph_result = json.dumps(records, ensure_ascii=False, indent=2)
+    prompt = GRAPH_QA_PROMPT.format(
+        question=question, graph_result=graph_result, role=role,
+    )
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    return response.content
+
+
+Step 7：NL2SQL（搜 数据库 PostgreSQL）
+1. 功能解释
+新建 src/agents/knowledge/nl2sql.py
+结构化数据统计查询。双重安全防线 + 容错重试 + 超时保护：
+- Prompt 层：不暴露敏感 patients.phone、patients.id_card
+- 代码层：正则拦截 DML/DDL + 敏感字段访问，自动补 LIMIT 100
+  - 安全层面的东西都是编码检查。
+- 重试：SQL 执行失败时，把错误信息反馈给 LLM 修正，最多重试 2 次
+- 超时：asyncio.wait_for 10 秒超时，防止慢查询阻塞
+- 审计：针对大SQL，慢SQL的优化
+
+2. 代码实现
+# src/agents/knowledge/nl2sql.py
+
+from __future__ import annotations
+import asyncio
+import re
+import json
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+from src.agents.knowledge.prompts import NL2SQL_PROMPT, SQL_QA_PROMPT
+
+MAX_SQL_RETRIES = 2
+SQL_TIMEOUT_SECONDS = 10
+
+FORBIDDEN_PATTERNS = [
+    re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE)\b", re.IGNORECASE),
+    re.compile(r"\bpatients\b[^;]*\b(phone|id_card)\b", re.IGNORECASE),
+]
+
+
+def _validate_sql(sql: str) -> tuple[bool, str]:
+    stripped = sql.strip().rstrip(";")
+    if not stripped.upper().startswith("SELECT"):
+        return False, "只允许 SELECT 查询"
+    for pattern in FORBIDDEN_PATTERNS:
+        if pattern.search(stripped):
+            return False, "查询包含禁止的操作或字段"
+    if "LIMIT" not in stripped.upper():
+        stripped += " LIMIT 100"
+    return True, stripped
+
+
+async def _generate_sql(
+    question: str, llm: BaseChatModel, error_hint: str = "",
+) -> str:
+    extra = ""
+    if error_hint:
+        extra = f"\n\n上一次生成的 SQL 执行报错：{error_hint}\n请修正后重新生成。"
+    prompt = NL2SQL_PROMPT.format(question=question) + extra
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    sql = response.content.strip()
+    if "```" in sql:
+        sql = sql.split("```")[1].lstrip("sql").strip()
+    return sql
+
+async def search_sql_raw(
+    question: str,
+    llm: BaseChatModel,
+    db: AsyncSession,
+)-> list[dict]:
+    """NL2SQL：LLM 生成 SQL → 安全校验 → 执行（带重试）→ LLM 整合。"""
+    error_hint = ""
+    for attempt in range(MAX_SQL_RETRIES + 1):
+        raw_sql = await _generate_sql(question, llm, error_hint)
+        logger.info(f"NL2SQL SQL (attempt {attempt + 1}): {raw_sql}")
+
+        valid, validated = _validate_sql(raw_sql)
+        if not valid:
+            logger.warning(f"SQL 安全校验失败: {validated}")
+            return f"查询被安全策略拦截：{validated}。请换一种方式提问。"
+
+        try:
+            query_result = await asyncio.wait_for(
+                db.execute(text(validated)),
+                timeout=SQL_TIMEOUT_SECONDS,
+            )
+            rows = query_result.mappings().all()
+            data = [dict(row) for row in rows[:100]]
+            break
+        except asyncio.TimeoutError:
+            logger.warning(f"SQL 执行超时 ({SQL_TIMEOUT_SECONDS}s): {validated}")
+            return f"查询执行超时（{SQL_TIMEOUT_SECONDS}秒），请简化查询条件后重试。"
+        except Exception as e:
+            error_hint = str(e)
+            logger.warning(f"SQL 执行失败 (attempt {attempt + 1}): {e}")
+            if attempt == MAX_SQL_RETRIES:
+                return "数据查询执行失败，请尝试换一种方式提问。"
+    else:
+        return "数据查询执行失败，请尝试换一种方式提问。"
+
+    if not data:
+        return "未查询到相关数据。"
+
+    return data
+
+async def search_sql(
+    question: str,
+    llm: BaseChatModel,
+    db: AsyncSession,
+) -> str:
+    data = await search_sql_raw(question, llm, db)
+    result_str = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    # 增强生成回答
+    prompt = SQL_QA_PROMPT.format(question=question, sql=validated, result=result_str)
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    return response.content
+
+
+Step 8：幻觉检测
+
+1. 功能解释
+新建 src/agents/knowledge/hallucination_check.py
+医疗场景对幻觉零容忍。回答生成后，LLM 逐条校验事实性陈述是否有检索结果支撑。
+async def check_hallucination(question, evidence, answer, llm, threshold=0.7) -> dict:
+    # 返回 {"is_grounded": bool, "unsupported_claims": [...], "confidence": float}
+    # confidence < 0.7 视为不可信
+    # 检测失败时默认信任回答（避免误拦截）
+
+2. 代码实现
+# src/agents/knowledge/hallucination_check.py
+
+from __future__ import annotations
+import json
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+
+from src.agents.knowledge.prompts import HALLUCINATION_CHECK_PROMPT
+
+
+async def check_hallucination(
+    question: str,
+    evidence: str,
+    answer: str,
+    llm: BaseChatModel,
+    threshold: float = 0.7,
+) -> dict:
+    """
+    幻觉检测：校验回答是否基于检索结果。
+    返回 {"is_grounded": bool, "unsupported_claims": [...], "confidence": float}
+    如果 confidence < threshold，标记为不可信。
+    """
+    prompt = HALLUCINATION_CHECK_PROMPT.format(
+        question=question, evidence=evidence, answer=answer,
+    )
+    try:
+        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        result = json.loads(content)
+        result["is_grounded"] = result.get("is_grounded", False) and result.get("confidence", 0) >= threshold
+        return result
+    except Exception as e:
+        logger.warning(f"幻觉检测失败: {e}")
+        return {"is_grounded": True, "unsupported_claims": [], "confidence": 1.0}
+
+
+3. SQL 练习生
+1. 定义好三张表： student， teacher、course、两两关系表
+2. 告诉大模型这些表的schema
+3. 写一前端，sql练习场。 一个问题，让用户写sql，发给后端执行。
+4. 问题：大模型基于这些表来生成1000个问题。分好难度等级。
+5. 用户执行的结果， 和 大模型生成的sql执行的结果进行比对。直接让大模型对比
+
+
+
+Step 9：多通道融合
+1. 功能解释
+新建 src/agents/knowledge/fusion.py
+医生问"糖尿病合并肾功能不全的降糖方案"，单独查文档能找到指南推荐，单独查图谱能找到药物禁忌，但只有把两个结果放在一起，才能发现"指南推荐的二甲双胍对这个患者有禁忌"这个关键冲突。
+多通道融合就是干这个的：并行查多个来源，合并结果，检测冲突，生成综合回答。
+一句话：复杂问题需要同时查多个来源。
+asyncio.gather 并行检索 → 结果格式化 → LLM 融合生成 → 幻觉检测。
+
+2. 代码实现
+# src/agents/knowledge/fusion.py
+
+from __future__ import annotations
+import asyncio
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+from neo4j import AsyncDriver
+from pymilvus import MilvusClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.agents.knowledge.prompts import FUSION_PROMPT
+from src.agents.knowledge.doc_rag import search_docs_raw, format_doc_context
+from src.agents.knowledge.graph_rag import search_graph_raw
+from src.agents.knowledge.hallucination_check import check_hallucination
+
+import json
+
+
+async def multi_channel_search(
+    question: str,
+    llm: BaseChatModel,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+    neo4j_driver: AsyncDriver,
+    db_session: AsyncSession | None = None,
+    channels: list[str] | None = None,
+    role: str = "patient",
+) -> str:
+    """
+    多通道并行检索 → 结果融合 → 幻觉检测 → 返回最终回答。
+    channels: 指定使用哪些通道 ["doc_rag", "graph_rag", "nl2sql"]，默认 doc_rag + graph_rag
+    """
+    if channels is None:
+        channels = ["doc_rag", "graph_rag"]
+
+    tasks = {}
+    if "doc_rag" in channels:
+        tasks["doc_rag"] = search_docs_raw(
+            question, embedding_model, milvus_client,
+        )
+    if "graph_rag" in channels:
+        tasks["graph_rag"] = search_graph_raw(
+            question, neo4j_driver, llm,
+        )
+    if "nl2sql" in channels and db_session:
+        from src.agents.knowledge.nl2sql import search_sql
+        tasks["nl2sql"] = search_sql(question, llm, db_session)
+
+    results = {}
+    gathered = await asyncio.gather(
+        *tasks.values(), return_exceptions=True,
+    )
+    for key, result in zip(tasks.keys(), gathered):
+        if isinstance(result, Exception):
+            logger.warning(f"通道 {key} 检索失败: {result}")
+            results[key] = None
+        else:
+            results[key] = result
+
+    source_parts = []
+    evidence_parts = []
+
+    doc_hits = results.get("doc_rag")
+    if doc_hits:
+        ctx = format_doc_context(doc_hits)
+        source_parts.append(f"### 文档检索结果\n{ctx}")
+        evidence_parts.append(ctx[:1000])
+
+    graph_records = results.get("graph_rag")
+    if graph_records:
+        graph_str = json.dumps(graph_records, ensure_ascii=False, indent=2)
+        source_parts.append(f"### 知识图谱检索结果\n{graph_str}")
+        evidence_parts.append(graph_str[:1000])
+
+    sql_answer = results.get("nl2sql")
+    if sql_answer and isinstance(sql_answer, str):
+        source_parts.append(f"### 运营数据查询结果\n{sql_answer}")
+        evidence_parts.append(sql_answer[:1000])
+
+    if not source_parts:
+        return "所有检索通道均未找到与您问题相关的信息。"
+
+    sources = "\n\n".join(source_parts)
+    prompt = FUSION_PROMPT.format(
+        question=question, sources=sources, role=role,
+    )
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    answer = response.content
+
+    evidence = "\n".join(evidence_parts)
+    hal_result = await check_hallucination(question, evidence, answer, llm)
+    if not hal_result["is_grounded"]:
+        claims = "、".join(hal_result.get("unsupported_claims", []))
+        answer += f"\n\n⚠️ 提示：以下内容未在检索结果中找到充分依据，请谨慎参考：{claims}"
+
+    return answer
+
+Step 10：处方审核工作流
+
+1. 功能解释
+新建 src/agents/knowledge/prescription_review.py
+药剂科核心场景。完整工作流：
+[图片]
+四项校验：
+暂时无法在飞书文档外展示此内容
+审核报告三级风险：
+🔴 严重（配伍禁忌/过敏）→ 拦截，
+🟡 中等（剂量偏高/重复）→ 警告，
+🟢 无风险 → 通过。
+
+2. 代码实现
+# src/agents/knowledge/prescription_review.py
+
+from __future__ import annotations
+import asyncio
+import json
+from loguru import logger
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+from neo4j import AsyncDriver
+from pymilvus import MilvusClient
+
+from src.agents.knowledge.prompts import (
+    PRESCRIPTION_PARSE_PROMPT, PRESCRIPTION_REPORT_PROMPT,
+)
+from src.agents.knowledge.doc_rag import search_docs_raw, format_doc_context
+from src.agents.knowledge.graph_rag import search_graph_raw
+
+
+async def _parse_prescription(question: str, llm: BaseChatModel) -> dict:
+    """从自然语言中提取处方结构化信息。"""
+    prompt = PRESCRIPTION_PARSE_PROMPT.format(question=question)
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"处方解析失败: {e}")
+        return {"drugs": [], "patient_info": {"allergies": [], "diseases": []}}
+
+
+async def _check_dosage(
+    drug_name: str,
+    dosage: str | None,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+) -> dict:
+    """剂量校验：查说明书推荐剂量范围。"""
+    query = f"{drug_name} 用法用量 推荐剂量"
+    hits = await search_docs_raw(
+        query, embedding_model, milvus_client,
+        top_k=5, rerank_top_k=2, doc_type="drug_instruction",
+    )
+    context = format_doc_context(hits) if hits else "未找到说明书"
+    return {
+        "type": "dosage",
+        "drug": drug_name,
+        "input_dosage": dosage,
+        "reference": context[:500],
+        "source": hits[0]["doc_name"] if hits else "无",
+    }
+
+
+async def _check_interaction(
+    drug_names: list[str],
+    neo4j_driver: AsyncDriver,
+    llm: BaseChatModel,
+) -> dict:
+    """配伍校验：查药物间相互作用。"""
+    if len(drug_names) < 2:
+        return {"type": "interaction", "drugs": drug_names, "result": "单药无需配伍校验", "records": []}
+
+    query = f"{'、'.join(drug_names)} 之间是否有药物相互作用或配伍禁忌"
+    records = await search_graph_raw(query, neo4j_driver, llm)
+    return {
+        "type": "interaction",
+        "drugs": drug_names,
+        "records": records[:10],
+        "result": json.dumps(records[:10], ensure_ascii=False) if records else "知识图谱中未发现配伍禁忌记录",
+    }
+
+
+async def _check_allergy(
+    drug_names: list[str],
+    allergies: list[str],
+    neo4j_driver: AsyncDriver,
+    llm: BaseChatModel,
+) -> dict:
+    """
+    过敏校验（成分级匹配）：
+    1. 字符串匹配：药品名 vs 过敏史
+    2. GraphRAG 成分级匹配：查药品所属类别，与过敏史交叉比对
+    """
+    conflicts = []
+    allergy_set = {a.lower() for a in allergies}
+
+    for drug in drug_names:
+        if drug.lower() in allergy_set:
+            conflicts.append({"drug": drug, "allergy": drug, "level": "exact_match"})
+            continue
+        for allergy in allergies:
+            if allergy.lower() in drug.lower() or drug.lower() in allergy.lower():
+                conflicts.append({"drug": drug, "allergy": allergy, "level": "name_match"})
+                break
+
+    if allergies and drug_names:
+        query = (
+            f"查询以下药品的药物类别和成分信息：{'、'.join(drug_names)}。"
+            f"患者对以下物质过敏：{'、'.join(allergies)}。"
+            f"判断是否存在交叉过敏风险。"
+        )
+        records = await search_graph_raw(query, neo4j_driver, llm)
+        if records:
+            for r in records[:10]:
+                r_str = json.dumps(r, ensure_ascii=False).lower()
+                for allergy in allergies:
+                    if allergy.lower() in r_str:
+                        drug_in_record = next(
+                            (d for d in drug_names if d.lower() in r_str), None,
+                        )
+                        if drug_in_record and not any(
+                            c["drug"] == drug_in_record for c in conflicts
+                        ):
+                            conflicts.append({
+                                "drug": drug_in_record,
+                                "allergy": allergy,
+                                "level": "component_match",
+                                "evidence": json.dumps(r, ensure_ascii=False)[:200],
+                            })
+
+    return {
+        "type": "allergy",
+        "allergies": allergies,
+        "conflicts": conflicts,
+        "result": (
+            f"发现过敏风险：{json.dumps(conflicts, ensure_ascii=False)}"
+            if conflicts else "未发现过敏冲突"
+        ),
+    }
+
+
+async def _check_duplicate(drug_list: list[dict]) -> dict:
+    """重复用药检查：同一处方中是否有同类药。"""
+    categories = {}
+    for d in drug_list:
+        name = d.get("name", "")
+        if name:
+            categories.setdefault(name, []).append(name)
+    duplicates = {k: v for k, v in categories.items() if len(v) > 1}
+    return {
+        "type": "duplicate",
+        "duplicates": duplicates,
+        "result": f"重复用药：{duplicates}" if duplicates else "未发现重复用药",
+    }
+
+
+async def review_prescription(
+    question: str,
+    llm: BaseChatModel,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+    neo4j_driver: AsyncDriver,
+) -> str:
+    """
+    处方审核完整流程：
+    解析处方 → 并行校验（剂量/配伍/过敏/重复）→ LLM 生成审核报告。
+    """
+    prescription = await _parse_prescription(question, llm)
+    drugs = prescription.get("drugs", [])
+    patient = prescription.get("patient_info", {})
+
+    if not drugs:
+        return "未能从您的描述中识别出具体药品信息，请提供药品名称、剂量等详细信息。"
+
+    drug_names = [d["name"] for d in drugs if d.get("name")]
+    allergies = patient.get("allergies", []) or []
+
+    tasks = [
+        _check_interaction(drug_names, neo4j_driver, llm),
+        _check_allergy(drug_names, allergies, neo4j_driver, llm),
+        _check_duplicate(drugs),
+    ]
+    for d in drugs:
+        if d.get("name"):
+            tasks.append(_check_dosage(
+                d["name"], d.get("dosage"),
+                embedding_model, milvus_client,
+            ))
+
+    check_results = await asyncio.gather(*tasks)
+
+    results_str = json.dumps(
+        list(check_results), ensure_ascii=False, indent=2, default=str,
+    )
+    prescription_str = json.dumps(prescription, ensure_ascii=False, indent=2)
+
+    prompt = PRESCRIPTION_REPORT_PROMPT.format(
+        prescription=prescription_str, check_results=results_str,
+    )
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    return response.content
+
+Step 11 - 14：企业级功能四件套
+这四个模块不影响核心检索流程，但在企业环境中不可或缺。
+1. 查询审计
+合规要求：
+谁在什么时间问了什么、系统走了哪条检索通道、返回了什么、幻觉检测是否通过。出了问题能追溯。
+
+QueryAuditLog.log() 用 logger.bind(audit=True) 打标签，可以在 loguru 配置中将审计日志单独输出到文件。Timer 上下文管理器测量每次工具调用耗时。
+
+# src/agents/knowledge/audit.py
+
+from __future__ import annotations
+import time
+from loguru import logger
+
+
+class QueryAuditLog:
+    """查询审计日志记录器。记录每次知识检索的完整链路。"""
+
+    @staticmethod
+    def log(
+        user_id: str,
+        role: str,
+        question: str,
+        intent: str,
+        channels: list[str],
+        answer_preview: str,
+        duration_ms: float,
+        hallucination_check: dict | None = None,
+    ) -> None:
+        logger.bind(audit=True).info(
+            "knowledge_query | "
+            f"user={user_id} | role={role} | intent={intent} | "
+            f"channels={channels} | duration={duration_ms:.0f}ms | "
+            f"grounded={hallucination_check.get('is_grounded', 'N/A') if hallucination_check else 'N/A'} | "
+            f"question={question[:80]} | "
+            f"answer={answer_preview[:80]}"
+        )
+
+
+class Timer:
+    """简单计时器，用于测量检索耗时。"""
+
+    def __init__(self):
+        self._start = None
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    @property
+    def elapsed_ms(self) -> float:
+        if self._start is None:
+            return 0.0
+        return (time.perf_counter() - self._start) * 1000
+
+2. 反馈闭环
+新建 src/agents/knowledge/feedback.py
+医生觉得回答不对，点个踩，附上评论"剂量信息过时了"。
+这些反馈积累起来，就知道哪些 Prompt 需要调优、哪些文档需要更新。
+写入 knowledge_feedback 表，提供统计接口（正面/负面/总数）。
+# src/agents/knowledge/feedback.py
+
+from __future__ import annotations
+from datetime import datetime
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+
+async def save_feedback(
+    db: AsyncSession,
+    user_id: str,
+    question: str,
+    answer: str,
+    rating: int,
+    comment: str = "",
+    intent: str = "",
+    channels: str = "",
+) -> int:
+    """
+    保存用户对知识问答的反馈（点赞/踩）。
+    rating: 1=有用, -1=无用, 0=未评价
+    返回反馈记录 ID。
+    """
+    
+    # 写入 knowledge_feedback 表
+    result = await db.execute(
+        text("""
+            INSERT INTO knowledge_feedback
+                (user_id, question, answer_preview, rating, comment, intent, channels, created_at)
+            VALUES
+                (:user_id, :question, :answer_preview, :rating, :comment, :intent, :channels, :created_at)
+            RETURNING id
+        """),
+        {
+            "user_id": user_id,
+            "question": question[:500],
+            "answer_preview": answer[:500],
+            "rating": rating,
+            "comment": comment[:1000],
+            "intent": intent,
+            "channels": channels,
+            "created_at": datetime.now(),
+        },
+    )
+    await db.commit()
+    row = result.fetchone()
+    feedback_id = row[0] if row else 0
+    logger.bind(audit=True).info(
+        f"knowledge_feedback | user={user_id} | rating={rating} | "
+        f"question={question[:60]} | comment={comment[:60]}"
+    )
+    return feedback_id
+
+
+async def get_feedback_stats(db: AsyncSession) -> dict:
+    """获取反馈统计数据。"""
+    
+    # 返回 {"total": N, "positive": N, "negative": N}
+    result = await db.execute(text("""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE rating = 1) AS positive,
+            COUNT(*) FILTER (WHERE rating = -1) AS negative
+        FROM knowledge_feedback
+    """))
+    row = result.fetchone()
+    if row:
+        return {"total": row[0], "positive": row[1], "negative": row[2]}
+    return {"total": 0, "positive": 0, "negative": 0}
+3. 知识更新通知
+《高血压诊疗指南》更新了，内科的医生需要知道。文档上传时自动写入 knowledge_notifications 表，按科室（category）过滤，支持标记已读。
+# src/agents/knowledge/notification.py
+
+from __future__ import annotations
+from datetime import datetime
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+
+async def notify_doc_update(
+    db: AsyncSession,
+    doc_name: str,
+    doc_type: str,
+    category: str,
+    action: str = "upload",
+) -> int:
+    """
+    记录知识文档更新通知。
+    文档上传/更新/删除时调用，写入通知表供相关科室查询。
+    """
+    result = await db.execute(
+        text("""
+            INSERT INTO knowledge_notifications
+                (doc_name, doc_type, category, action, is_read, created_at)
+            VALUES
+                (:doc_name, :doc_type, :category, :action, false, :created_at)
+            RETURNING id
+        """),
+        {
+            "doc_name": doc_name,
+            "doc_type": doc_type,
+            "category": category,
+            "action": action,
+            "created_at": datetime.now(),
+        },
+    )
+    await db.commit()
+    row = result.fetchone()
+    nid = row[0] if row else 0
+    logger.info(f"知识更新通知 | action={action} | doc={doc_name} | category={category}")
+    return nid
+
+
+async def get_unread_notifications(
+    db: AsyncSession,
+    category: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """获取未读的知识更新通知。"""
+    if category:
+        result = await db.execute(
+            text("""
+                SELECT id, doc_name, doc_type, category, action, created_at
+                FROM knowledge_notifications
+                WHERE is_read = false AND category = :category
+                ORDER BY created_at DESC LIMIT :limit
+            """),
+            {"category": category, "limit": limit},
+        )
+    else:
+        result = await db.execute(
+            text("""
+                SELECT id, doc_name, doc_type, category, action, created_at
+                FROM knowledge_notifications
+                WHERE is_read = false
+                ORDER BY created_at DESC LIMIT :limit
+            """),
+            {"limit": limit},
+        )
+    rows = result.fetchall()
+    return [
+        {
+            "id": r[0], "doc_name": r[1], "doc_type": r[2],
+            "category": r[3], "action": r[4],
+            "created_at": str(r[5]),
+        }
+        for r in rows
+    ]
+
+
+async def mark_notifications_read(db: AsyncSession, ids: list[int]) -> None:
+    """标记通知为已读。"""
+    if not ids:
+        return
+    await db.execute(
+        text("UPDATE knowledge_notifications SET is_read = true WHERE id = ANY(:ids)"),
+        {"ids": ids},
+    )
+    await db.commit()
+
+4. 多轮知识对话
+医生先问"糖尿病的常用药"，接着问"这些药有什么副作用"——"这些药"指的是上一轮回答中的药物。如果没有对话上下文，第二个问题就没法回答。用 Redis 存储对话历史（最近 10 轮，30 分钟 TTL），格式化为 Prompt 可用的上下文字符串。
+# src/agents/knowledge/conversation.py
+
+from __future__ import annotations
+import json
+from loguru import logger
+
+
+CONTEXT_TTL = 1800
+MAX_HISTORY = 10
+
+
+async def load_conversation_context(
+    redis_client,
+    user_id: str,
+    session_id: str,
+) -> list[dict]:
+    """从 Redis 加载知识对话上下文。"""
+    key = f"knowledge_ctx:{user_id}:{session_id}"
+    try:
+        raw = await redis_client.get(key)
+        if raw:
+            return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"加载知识对话上下文失败: {e}")
+    return []
+
+
+async def save_conversation_context(
+    redis_client,
+    user_id: str,
+    session_id: str,
+    history: list[dict],
+) -> None:
+    """保存知识对话上下文到 Redis。"""
+    key = f"knowledge_ctx:{user_id}:{session_id}"
+    trimmed = history[-MAX_HISTORY:]
+    try:
+        await redis_client.set(key, json.dumps(trimmed, ensure_ascii=False), ex=CONTEXT_TTL)
+    except Exception as e:
+        logger.warning(f"保存知识对话上下文失败: {e}")
+
+
+async def append_turn(
+    redis_client,
+    user_id: str,
+    session_id: str,
+    question: str,
+    answer: str,
+) -> list[dict]:
+    """追加一轮对话到上下文，返回更新后的历史。"""
+    history = await load_conversation_context(redis_client, user_id, session_id)
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": answer[:500]})
+    await save_conversation_context(redis_client, user_id, session_id, history)
+    return history
+
+
+def format_conversation_context(history: list[dict]) -> str:
+    """将对话历史格式化为 Prompt 可用的字符串。"""
+    if not history:
+        return ""
+    parts = []
+    for turn in history[-6:]:
+        role = "用户" if turn["role"] == "user" else "助手"
+        parts.append(f"{role}：{turn['content']}")
+    return "以下是之前的对话上下文：\n" + "\n".join(parts) + "\n\n"
+
+
+5. 数据模型
+新建 src/agents/knowledge/model.py
+from sqlalchemy import String, SmallInteger, Boolean, Index
+from sqlalchemy.orm import Mapped, mapped_column
+from src.core.base_model import BaseModel
+
+
+class KnowledgeFeedback(BaseModel):
+    """用户对知识问答回答的反馈记录。"""
+    __tablename__ = "knowledge_feedback"
+
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, comment="用户 ID")
+    question: Mapped[str] = mapped_column(String(500), nullable=False, comment="用户提问")
+    answer_preview: Mapped[str] = mapped_column(String(500), default="", comment="系统回答预览")
+    rating: Mapped[int] = mapped_column(SmallInteger, default=0, comment="1=有用, -1=无用, 0=未评价")
+    comment: Mapped[str] = mapped_column(String(1000), default="", comment="用户文字反馈")
+    intent: Mapped[str] = mapped_column(String(50), default="", comment="检索意图")
+    channels: Mapped[str] = mapped_column(String(100), default="", comment="使用的检索通道")
+
+    __table_args__ = (
+        Index("ix_knowledge_feedback_user", "user_id"),
+        Index("ix_knowledge_feedback_rating", "rating"),
+    )
+
+
+class KnowledgeNotification(BaseModel):
+    """知识文档更新通知。"""
+    __tablename__ = "knowledge_notifications"
+
+    doc_name: Mapped[str] = mapped_column(String(256), nullable=False, comment="文档名称")
+    doc_type: Mapped[str] = mapped_column(String(50), nullable=False, comment="文档类型")
+    category: Mapped[str] = mapped_column(String(100), nullable=False, comment="所属分类")
+    action: Mapped[str] = mapped_column(String(20), default="upload", comment="操作类型")
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否已读")
+
+    __table_args__ = (
+        Index("ix_knowledge_notifications_category", "category"),
+        Index("ix_knowledge_notifications_is_read", "is_read"),
+    )
+继承 BaseModel 后自动拥有 id（BigInteger 自增主键）、created_at、updated_at 三个字段，与项目其他表保持一致。
+
+6. 迁移数据
+# 修改 alembic/env.py，添加一行 import
+
+# 这里要导入所有模型模块，确保 metadata 收集到全部表
+from src.modules.medical.model import *
+from src.agents.knowledge.model import *    # ← 新增这一行
+
+# 自动生成迁移文件（Alembic 对比 Model 定义和数据库现状，生成差异 SQL）
+alembic revision --autogenerate -m "add knowledge feedback and notifications"
+
+# 执行迁移（在数据库中创建表）
+alembic upgrade head
+
+
+
+
+
+Step 15：文档解析与导入
+1. MinerU 文档解析客户端（mineru_client.py）
+1. 临床指南 PDF 通常包含大量表格（用药剂量表）和公式（GFR 计算公式）。
+2. LlamaIndex 的 SimpleDirectoryReader 解析这类 PDF 时，表格结构丢失、公式变乱码。
+3. MinerU 是专业的文档解析引擎，能精确还原表格为 Markdown 表格、公式为 LaTeX。
+客户端支持异步模式（POST /tasks → 轮询）和同步模式（POST /file_parse），MinerU 服务不可用时自动降级。
+
+# src/agents/knowledge/mineru_client.py
+
+from __future__ import annotations
+import asyncio
+import httpx
+from pathlib import Path
+from loguru import logger
+
+from src.core.config import get_settings
+
+settings = get_settings()
+
+
+async def parse_document(
+    file_path: str,
+    file_name: str | None = None,
+    backend: str | None = None,
+    return_images: bool = False,
+) -> str:
+    """
+    调用 MinerU API 解析文档，返回 Markdown 文本。
+    支持 PDF、Word、图片等格式。
+
+    优先使用异步接口（POST /tasks → 轮询），超大文件不会阻塞。
+    """
+    base_url = settings.MINERU_API_URL
+    backend = backend or settings.MINERU_BACKEND
+    timeout = settings.MINERU_TIMEOUT
+
+    if not file_name:
+        file_name = Path(file_path).name
+
+    file_bytes = Path(file_path).read_bytes()
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # 提交异步解析任务
+        resp = await client.post(
+            f"{base_url}/tasks",
+            files={"files": (file_name, file_bytes)},
+            data={
+                "backend": backend,
+                "return_md": "true",
+                "return_images": str(return_images).lower(),
+                "formula_enable": "true",
+                "table_enable": "true",
+            },
+        )
+        resp.raise_for_status()
+        task_data = resp.json()
+        task_id = task_data.get("task_id")
+
+        if not task_id:
+            logger.warning(f"MinerU 未返回 task_id，尝试同步解析")
+            return await _parse_sync(file_path, file_name, backend)
+
+        # 轮询等待完成
+        for _ in range(timeout // 2):
+            await asyncio.sleep(2)
+            status_resp = await client.get(f"{base_url}/tasks/{task_id}")
+            status_resp.raise_for_status()
+            status_data = status_resp.json()
+            status = status_data.get("status", "")
+
+            if status == "completed":
+                result_resp = await client.get(f"{base_url}/tasks/{task_id}/result")
+                if result_resp.status_code == 200:
+                    result = result_resp.json()
+                    return _extract_markdown(result)
+                break
+            elif status == "failed":
+                error = status_data.get("error", "未知错误")
+                logger.error(f"MinerU 解析失败: {error}")
+                raise RuntimeError(f"MinerU 解析失败: {error}")
+
+        raise TimeoutError(f"MinerU 解析超时 ({timeout}s)")
+
+
+async def _parse_sync(
+    file_path: str,
+    file_name: str,
+    backend: str,
+) -> str:
+    """同步解析（兜底方案）。"""
+    base_url = settings.MINERU_API_URL
+    file_bytes = Path(file_path).read_bytes()
+
+    async with httpx.AsyncClient(timeout=settings.MINERU_TIMEOUT) as client:
+        resp = await client.post(
+            f"{base_url}/file_parse",
+            files={"files": (file_name, file_bytes)},
+            data={
+                "backend": backend,
+                "return_md": "true",
+                "formula_enable": "true",
+                "table_enable": "true",
+            },
+        )
+        resp.raise_for_status()
+        return _extract_markdown(resp.json())
+
+
+def _extract_markdown(result: dict) -> str:
+    """从 MinerU 响应中提取 Markdown 文本。"""
+    # MinerU 返回格式：{"results": [{"md": "...", ...}]}
+    results = result.get("results", [])
+    if results:
+        first = results[0]
+        if isinstance(first, dict):
+            md = first.get("md", "")
+            if md:
+                return md
+    # 兜底：尝试直接取 md 字段
+    if "md" in result:
+        return result["md"]
+    # 再兜底：整个 result 转字符串
+    import json
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def check_mineru_health() -> dict:
+    """检查 MinerU 服务健康状态。"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{settings.MINERU_API_URL}/health")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)}
+
+
+2. 文档导入 Pipeline（doc_ingestion.py）
+把解析好的文档切块、向量化、存入 Milvus。这是知识库的"入口"。
+导入流程：MinerU 解析（优先）→ 失败回退 LlamaIndex → Markdown 智能分块（按段落分割，保持段落完整性）→ DashScope Embedding 向量化 → 写入 Milvus。
+增量更新：按 doc_id（文档名 MD5 前 16 位）删旧插新，重复导入不产生重复数据。
+
+# src/agents/knowledge/doc_ingestion.py
+
+from __future__ import annotations
+import hashlib
+from loguru import logger
+from langchain_core.embeddings import Embeddings
+from pymilvus import (
+    MilvusClient, DataType,
+)
+
+from src.agents.knowledge.doc_rag import COLLECTION_NAME
+
+EMBEDDING_DIM = 1024
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+
+
+def ensure_knowledge_collection(milvus_client: MilvusClient) -> None:
+    """确保 knowledge_docs collection 存在。"""
+    if milvus_client.has_collection(COLLECTION_NAME):
+        return
+
+    schema = MilvusClient.create_schema(auto_id=False)
+    schema.add_field("id", DataType.VARCHAR, max_length=256, is_primary=True)
+    schema.add_field("doc_id", DataType.VARCHAR, max_length=128)
+    schema.add_field("doc_name", DataType.VARCHAR, max_length=256)
+    schema.add_field("doc_type", DataType.VARCHAR, max_length=50)
+    schema.add_field("category", DataType.VARCHAR, max_length=100)
+    schema.add_field("page_number", DataType.INT64)
+    schema.add_field("chunk_index", DataType.INT64)
+    schema.add_field("text", DataType.VARCHAR, max_length=65535)
+    schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+
+    index_params = MilvusClient.prepare_index_params()
+    index_params.add_index(
+        field_name="embedding",
+        metric_type="COSINE",
+        index_type="IVF_FLAT",
+        params={"nlist": 128},
+    )
+
+    milvus_client.create_collection(
+        collection_name=COLLECTION_NAME,
+        schema=schema,
+        index_params=index_params,
+    )
+    logger.info(f"Collection '{COLLECTION_NAME}' 创建成功")
+
+
+async def _parse_with_mineru(file_path: str, file_name: str) -> str | None:
+    """尝试用 MinerU 解析文档，失败则返回 None。"""
+    try:
+        from src.agents.knowledge.mineru_client import parse_document
+        md_text = await parse_document(file_path, file_name)
+        if md_text and len(md_text.strip()) > 10:
+            logger.info(f"MinerU 解析成功: {file_name} ({len(md_text)} chars)")
+            return md_text
+    except Exception as e:
+        logger.warning(f"MinerU 解析失败，回退到 LlamaIndex: {e}")
+    return None
+
+
+async def _parse_with_llamaindex(file_path: str) -> list:
+    """用 LlamaIndex 解析文档（兜底方案）。"""
+    from llama_index.core import SimpleDirectoryReader
+    reader = SimpleDirectoryReader(input_files=[file_path])
+    return reader.load_data()
+
+
+def _split_markdown(md_text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """
+    对 MinerU 输出的 Markdown 做智能分块。
+    按段落（双换行）分割，再按 chunk_size 合并。
+    """
+    paragraphs = md_text.split("\n\n")
+    chunks = []
+    current = ""
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(current) + len(para) + 2 <= chunk_size:
+            current = current + "\n\n" + para if current else para
+        else:
+            if current:
+                chunks.append(current)
+            if len(para) > chunk_size:
+                for i in range(0, len(para), chunk_size - overlap):
+                    chunks.append(para[i:i + chunk_size])
+            else:
+                current = para
+                continue
+            current = ""
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+async def ingest_file(
+    file_path: str,
+    doc_name: str,
+    doc_type: str,
+    category: str,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+) -> int:
+    """
+    导入单个文档到 Milvus。
+    优先使用 MinerU 解析（高精度），失败回退到 LlamaIndex。
+    """
+    from llama_index.core.node_parser import SentenceSplitter
+
+    ensure_knowledge_collection(milvus_client)
+    doc_id = hashlib.md5(doc_name.encode()).hexdigest()[:16]
+
+    milvus_client.delete(
+        collection_name=COLLECTION_NAME,
+        filter=f'doc_id == "{doc_id}"',
+    )
+
+    # 优先 MinerU，失败回退 LlamaIndex
+    md_text = await _parse_with_mineru(file_path, doc_name)
+
+    if md_text:
+        chunks = _split_markdown(md_text)
+        texts = chunks
+        pages = [0] * len(chunks)
+    else:
+        documents = await _parse_with_llamaindex(file_path)
+        splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        nodes = splitter.get_nodes_from_documents(documents)
+        if not nodes:
+            logger.warning(f"文档 '{doc_name}' 解析后无内容")
+            return 0
+        texts = [node.get_content() for node in nodes]
+        pages = []
+        for node in nodes:
+            page = node.metadata.get("page_label", 0)
+            try:
+                pages.append(int(page))
+            except (ValueError, TypeError):
+                pages.append(0)
+
+    if not texts:
+        return 0
+
+    batch_size = 50
+    all_data = []
+
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        embeddings = await embedding_model.aembed_documents(batch_texts)
+
+        for j, (text_content, emb) in enumerate(zip(batch_texts, embeddings)):
+            chunk_idx = i + j
+            all_data.append({
+                "id": f"{doc_id}_{chunk_idx}",
+                "doc_id": doc_id,
+                "doc_name": doc_name,
+                "doc_type": doc_type,
+                "category": category,
+                "page_number": pages[chunk_idx] if chunk_idx < len(pages) else 0,
+                "chunk_index": chunk_idx,
+                "text": text_content[:65000],
+                "embedding": emb,
+            })
+
+    milvus_client.insert(collection_name=COLLECTION_NAME, data=all_data)
+    logger.info(f"文档 '{doc_name}' 导入完成，共 {len(all_data)} 个分块")
+    return len(all_data)
+
+
+async def ingest_drug_instructions(
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+    db_session,
+) -> int:
+    """从 PostgreSQL drug_details 表导入药品说明书到 Milvus。"""
+    from sqlalchemy import select
+    from src.modules.medical.model import Drug, DrugDetail
+    from llama_index.core.node_parser import SentenceSplitter
+
+    ensure_knowledge_collection(milvus_client)
+
+    result = await db_session.execute(
+        select(Drug.name, DrugDetail.full_instruction)
+        .join(DrugDetail, Drug.id == DrugDetail.drug_id)
+        .where(DrugDetail.full_instruction.isnot(None))
+    )
+    rows = result.all()
+
+    if not rows:
+        logger.warning("drug_details 表中无说明书数据")
+        return 0
+
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    total = 0
+
+    for drug_name, instruction in rows:
+        if not instruction or not instruction.strip():
+            continue
+
+        doc_id = hashlib.md5(f"drug_{drug_name}".encode()).hexdigest()[:16]
+        milvus_client.delete(
+            collection_name=COLLECTION_NAME,
+            filter=f'doc_id == "{doc_id}"',
+        )
+
+        from llama_index.core import Document
+        doc = Document(text=instruction, metadata={"drug_name": drug_name})
+        nodes = splitter.get_nodes_from_documents([doc])
+        texts = [n.get_content() for n in nodes]
+
+        if not texts:
+            continue
+
+        embeddings = await embedding_model.aembed_documents(texts)
+        data = []
+        for idx, (text_content, emb) in enumerate(zip(texts, embeddings)):
+            data.append({
+                "id": f"{doc_id}_{idx}",
+                "doc_id": doc_id,
+                "doc_name": f"{drug_name}说明书",
+                "doc_type": "drug_instruction",
+                "category": "药剂科",
+                "page_number": 0,
+                "chunk_index": idx,
+                "text": text_content[:65000],
+                "embedding": emb,
+            })
+
+        milvus_client.insert(collection_name=COLLECTION_NAME, data=data)
+        total += len(data)
+
+    logger.info(f"药品说明书导入完成，共 {total} 个分块")
+    return total
+
+文件上传以后的 3 步标准化处理：
+1. 去数据库记录文件上传历史信息：用来保存文件操作历史
+2. 去Minio保存文件真正对象：用来查看文件原始内容
+3. 去Mivlus保存文件向量：用来做相似度检索
+4. 更多：给 kafka 发送消息，给 redis 缓存操作
+
+Step 16：工具封装 — 把所有能力包装成 LLM 可调用的工具
+新建 src/agents/knowledge/tools.py
+前面 16 步实现了各种能力（检索、融合、审核、审计...），但这些都是 Python 函数，LLM 不能直接调用。需要把它们包装成 LangChain 的 @tool，LLM 才能通过 Function Calling 来使用。
+
+1. 依赖注入容器
+KnowledgeDeps 把所有共享资源（LLM、Embedding 模型、Milvus 客户端、Neo4j Driver、DB Session、用户 ID、角色）打包在一起。build_knowledge_tools 通过闭包捕获 deps，返回的 5 个工具函数都能访问这些资源，无需全局变量。
+2. 每个工具的增强
+每个工具调用时自动做两件事：
+1. Query 改写：调用 rewrite_query 预处理用户问题
+2. 审计日志：用 Timer 计时 + QueryAuditLog.log 记录
+这样上层代码（知识 Agent、药物 Agent）不需要关心改写和审计，工具层统一处理。
+
+3. 代码实现
+# src/agents/knowledge/tools.py
+
+from __future__ import annotations
+from langchain_core.tools import tool
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+from neo4j import AsyncDriver
+from pymilvus import MilvusClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.agents.knowledge.audit import QueryAuditLog, Timer
+
+
+class KnowledgeDeps:
+    """知识 Agent 的依赖注入容器。"""
+    def __init__(
+        self,
+        llm: BaseChatModel,
+        embedding_model: Embeddings,
+        milvus_client: MilvusClient,
+        neo4j_driver: AsyncDriver,
+        db_session: AsyncSession | None = None,
+        user_id: str = "anonymous",
+        role: str = "patient",
+    ):
+        self.llm = llm
+        self.embedding_model = embedding_model
+        self.milvus_client = milvus_client
+        self.neo4j_driver = neo4j_driver
+        self.db_session = db_session
+        self.user_id = user_id
+        self.role = role
+
+
+async def _rewrite(question: str, deps: KnowledgeDeps) -> str:
+    """Query 改写：口语→医学术语。返回改写后的首条查询。"""
+    from src.agents.knowledge.query_rewriter import rewrite_query
+    result = await rewrite_query(question, deps.llm, deps.role)
+    return result["queries"][0] if result.get("queries") else question
+
+
+def build_knowledge_tools(deps: KnowledgeDeps) -> list:
+    """构建知识 Agent 的工具集（含 Query 改写预处理）。"""
+
+    @tool
+    async def search_knowledge_docs(question: str, doc_type: str = "") -> str:
+        """从知识文档库中检索信息并生成回答。
+        适用：查询临床指南、药品说明书、医院制度SOP、医学文献等文档内容。
+        question: 用户的问题
+        doc_type: 可选，文档类型过滤（guideline/drug_instruction/sop/literature）"""
+        from src.agents.knowledge.doc_rag import search_docs
+        rewritten = await _rewrite(question, deps)
+        with Timer() as t:
+            result = await search_docs(
+                question=rewritten, embedding_model=deps.embedding_model,
+                milvus_client=deps.milvus_client, llm=deps.llm,
+                doc_type=doc_type or None, role=deps.role,
+            )
+        QueryAuditLog.log(
+            deps.user_id, deps.role, question, "doc_rag",
+            ["doc_rag"], result[:80], t.elapsed_ms,
+        )
+        return result
+
+    @tool
+    async def search_knowledge_graph(question: str) -> str:
+        """从医学知识图谱中检索实体关系并生成回答。
+        适用：查询疾病与症状/药物/科室/检查/食物之间的关系，多跳推理。
+        question: 用户的问题"""
+        from src.agents.knowledge.graph_rag import search_graph
+        rewritten = await _rewrite(question, deps)
+        with Timer() as t:
+            result = await search_graph(
+                question=rewritten, neo4j_driver=deps.neo4j_driver,
+                llm=deps.llm, role=deps.role,
+            )
+        QueryAuditLog.log(
+            deps.user_id, deps.role, question, "graph_rag",
+            ["graph_rag"], result[:80], t.elapsed_ms,
+        )
+        return result
+
+    @tool
+    async def search_knowledge_sql(question: str) -> str:
+        """从运营数据库中查询统计数据并生成回答。
+        适用：查询问诊量、药品库存、科室排名、收入统计等结构化数据。
+        question: 用户的问题"""
+        if deps.db_session is None:
+            return "数据库连接不可用，无法执行查询。"
+        from src.agents.knowledge.nl2sql import search_sql
+        with Timer() as t:
+            result = await search_sql(question=question, llm=deps.llm, db=deps.db_session)
+        QueryAuditLog.log(
+            deps.user_id, deps.role, question, "nl2sql",
+            ["nl2sql"], result[:80], t.elapsed_ms,
+        )
+        return result
+
+    @tool
+    async def search_knowledge_multi(question: str) -> str:
+        """多通道融合检索：同时查文档库和知识图谱，综合多个来源生成回答。
+        适用：复杂问题，需要同时参考指南文档和实体关系才能回答。
+        例如："糖尿病合并肾功能不全的降糖方案"需要同时查指南和药物禁忌。
+        question: 用户的问题"""
+        from src.agents.knowledge.fusion import multi_channel_search
+        rewritten = await _rewrite(question, deps)
+        with Timer() as t:
+            result = await multi_channel_search(
+                question=rewritten, llm=deps.llm,
+                embedding_model=deps.embedding_model,
+                milvus_client=deps.milvus_client,
+                neo4j_driver=deps.neo4j_driver,
+                db_session=deps.db_session,
+                role=deps.role,
+            )
+        QueryAuditLog.log(
+            deps.user_id, deps.role, question, "multi",
+            ["doc_rag", "graph_rag"], result[:80], t.elapsed_ms,
+        )
+        return result
+
+    @tool
+    async def review_prescription_tool(question: str) -> str:
+        """处方审核：校验处方中的药品剂量、配伍禁忌、过敏冲突、重复用药。
+        适用：药师审核处方安全性，或医生想确认用药方案是否合理。
+        输入处方信息（药品名+剂量+患者信息），输出审核报告。
+        question: 处方信息描述"""
+        from src.agents.knowledge.prescription_review import review_prescription
+        with Timer() as t:
+            result = await review_prescription(
+                question=question, llm=deps.llm,
+                embedding_model=deps.embedding_model,
+                milvus_client=deps.milvus_client,
+                neo4j_driver=deps.neo4j_driver,
+            )
+        QueryAuditLog.log(
+            deps.user_id, deps.role, question, "prescription",
+            ["doc_rag", "graph_rag"], result[:80], t.elapsed_ms,
+        )
+        return result
+
+    return [
+        search_knowledge_docs,
+        search_knowledge_graph,
+        search_knowledge_sql,
+        search_knowledge_multi,
+        review_prescription_tool,
+    ]
+
+Step 17：Agent 组装
+1. 知识 Agent 主体（knowledge_agent.py）
+System Prompt 是关键——它告诉 LLM 有哪些工具、什么场景用什么工具。特别加了"工具选择策略"段落，减少 LLM 的"选择困难"：
+- 不确定时优先用 search_knowledge_multi（多通道融合），它会自动查多个来源
+- 处方相关的问题必须用 review_prescription_tool，不能用通用检索代替
+
+# src/agents/workers/knowledge_agent.py
+
+from langchain.agents import create_agent
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+
+from src.core.config import get_settings
+from src.infra.neo4j_client import get_neo4j_driver
+from src.infra.milvus_client import get_milvus_client_alias
+from src.agents.knowledge.tools import KnowledgeDeps, build_knowledge_tools
+
+settings = get_settings()
+
+KNOWLEDGE_SYSTEM_PROMPT = """你是天宫医疗的知识问答助手，面向医生、药师和企业内部员工提供专业知识服务。
+
+## 你的能力
+
+你拥有五个检索工具，根据问题类型选择最合适的工具：
+
+1. search_knowledge_docs — 文档检索
+   适用：查询临床指南、药品说明书、医院制度SOP、医学文献
+   示例："高血压诊疗指南推荐的一线用药"、"阿莫西林的禁忌症"
+
+2. search_knowledge_graph — 知识图谱检索
+   适用：查询疾病与症状/药物/科室/检查/食物的关系，多跳推理
+   示例："糖尿病的常用药有哪些"、"头痛可能是什么疾病需要做什么检查"
+
+3. search_knowledge_sql — 运营数据查询
+   适用：统计数据、数量、排名、趋势、库存
+   示例："上个月各科室问诊量排名"、"库存不足100的OTC药品"
+
+4. search_knowledge_multi — 多通道融合检索（复杂问题首选）
+   适用：需要同时参考文档和知识图谱才能回答的复杂问题
+   示例："糖尿病合并肾功能不全的降糖方案"、"高血压患者能用哪些感冒药"
+
+5. review_prescription_tool — 处方审核
+   适用：校验处方安全性（剂量、配伍禁忌、过敏冲突、重复用药）
+   示例："帮我审核这张处方：阿莫西林0.5g tid + 甲硝唑0.4g bid"
+
+## 工具选择策略
+
+- 简单的文档查询 → search_knowledge_docs
+- 实体关系查询 → search_knowledge_graph
+- 统计数据查询 → search_knowledge_sql
+- 涉及"合并症+用药"、"禁忌+推荐"等复杂问题 → search_knowledge_multi
+- 处方审核、用药安全校验 → review_prescription_tool
+- 不确定时优先用 search_knowledge_multi，它会自动融合多个来源
+
+## 工作原则
+
+1. 回答必须基于工具返回的检索结果，不要编造信息
+2. 回答中必须标注信息来源
+3. 如果所有工具都未找到相关信息，明确告知用户
+4. 涉及用药安全的问题，必须提醒"请遵医嘱"
+5. 语言专业但易懂"""
+
+
+def _build_deps(db_session=None, user_id="anonymous", role="patient") -> KnowledgeDeps:
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    neo4j_driver = get_neo4j_driver()
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    return KnowledgeDeps(
+        llm=llm,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        neo4j_driver=neo4j_driver,
+        db_session=db_session,
+        user_id=user_id,
+        role=role,
+    )
+
+
+def create_knowledge_agent(db_session=None, user_id="anonymous", role="patient"):
+    deps = _build_deps(db_session, user_id, role)
+    tools = build_knowledge_tools(deps)
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=KNOWLEDGE_SYSTEM_PROMPT,
+        name="knowledge_agent",
+    )
+
+
+_knowledge_agent = None
+
+def get_knowledge_agent():
+    global _knowledge_agent
+    if _knowledge_agent is None:
+        _knowledge_agent = create_knowledge_agent()
+    return _knowledge_agent
+
+2. 药物 Agent（drug_agent.py）
+从 5 个工具中取 4 个（排除 NL2SQL），加上自己的 System Prompt（侧重用药安全、过敏校验、遵医嘱提醒）。
+# src/agents/workers/drug_agent.py
+
+from langchain.agents import create_agent
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+
+from src.core.config import get_settings
+from src.infra.neo4j_client import get_neo4j_driver
+from src.infra.milvus_client import get_milvus_client_alias
+from src.agents.knowledge.tools import KnowledgeDeps, build_knowledge_tools
+
+settings = get_settings()
+
+DRUG_SYSTEM_PROMPT = """你是天宫医疗的药物咨询助手。
+
+## 你的职责
+1. 根据患者病情推荐合适的药物
+2. 检测药物之间的相互作用（药物交互检测）
+3. 审查处方，找出潜在风险（剂量、禁忌症、过敏史冲突）
+4. 用通俗语言解释用药注意事项
+
+## 你的工具
+- search_knowledge_docs：查询药品说明书（适应症、禁忌症、不良反应、用法用量）
+- search_knowledge_graph：查询药物与疾病的关系（常用药、推荐药、药物关联的疾病）
+- search_knowledge_multi：复杂用药问题，同时查说明书和知识图谱
+- review_prescription_tool：处方审核（剂量、配伍、过敏、重复用药校验）
+
+## 工具选择策略
+- 查某个药的说明书信息 → search_knowledge_docs
+- 查疾病的常用药/推荐药 → search_knowledge_graph
+- 涉及合并症+用药的复杂问题 → search_knowledge_multi
+- 审核处方安全性 → review_prescription_tool
+
+## 安全规则
+- 如果用户提到过敏史，必须在回答中校验推荐药物是否与过敏史冲突
+- 药物建议仅供参考，必须提醒用户遵医嘱用药
+- 不确定的药物交互信息，明确标注"建议咨询药师确认"
+
+回复格式：
+- 推荐药物：xxx（用途：xxx，用法：xxx）
+- 药物交互风险：xxx
+- 注意事项：xxx
+- 禁忌提示：xxx"""
+
+
+def create_drug_agent():
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.1,
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    neo4j_driver = get_neo4j_driver()
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    deps = KnowledgeDeps(
+        llm=llm,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        neo4j_driver=neo4j_driver,
+    )
+    knowledge_tools = build_knowledge_tools(deps)
+    tools = [t for t in knowledge_tools if t.name != "search_knowledge_sql"]
+
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=DRUG_SYSTEM_PROMPT,
+        name="drug_agent",
+    )
+
+
+_drug_agent = None
+
+def get_drug_agent():
+    global _drug_agent
+    if _drug_agent is None:
+        _drug_agent = create_drug_agent()
+    return _drug_agent
+
+3. 运营 Agent（operation_agent.py）
+只取 NL2SQL 1 个工具，System Prompt 侧重数据脱敏和权限管控。
+# src/agents/workers/operation_agent.py
+
+from langchain.agents import create_agent
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+
+from src.core.config import get_settings
+from src.infra.neo4j_client import get_neo4j_driver
+from src.infra.milvus_client import get_milvus_client_alias
+from src.agents.knowledge.tools import KnowledgeDeps, build_knowledge_tools
+
+settings = get_settings()
+
+OPERATION_SYSTEM_PROMPT = """你是天宫医疗的运营数据助手。
+
+## 你的职责
+1. 根据运营人员的自然语言问题，查询统计数据
+2. 生成数据报表和趋势分析
+3. 辅助医院管理层做运营决策
+
+## 你的工具
+- search_knowledge_sql：查询运营数据库中的统计数据（问诊量、药品库存、科室排名等）
+
+## 安全规则
+- 只允许查询聚合统计数据，严禁返回患者个人信息
+- 所有查询结果需脱敏处理
+- 如果问题涉及患者隐私，拒绝回答并说明原因
+
+回复格式：
+- 数据摘要：xxx
+- 关键指标：xxx
+- 趋势分析：xxx
+- 决策建议：xxx
+
+注意：数据查询结果仅供内部运营参考。"""
+
+
+def create_operation_agent(db_session=None):
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.2,
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    neo4j_driver = get_neo4j_driver()
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    deps = KnowledgeDeps(
+        llm=llm,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        neo4j_driver=neo4j_driver,
+        db_session=db_session,
+    )
+    knowledge_tools = build_knowledge_tools(deps)
+    tools = [t for t in knowledge_tools if t.name == "search_knowledge_sql"]
+
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=OPERATION_SYSTEM_PROMPT,
+        name="operation_agent",
+    )
+
+
+_operation_agent = None
+
+def get_operation_agent():
+    global _operation_agent
+    if _operation_agent is None:
+        _operation_agent = create_operation_agent()
+    return _operation_agent
+
+Step 18：REST API（功能接口）
+新建 src/api/routers/knowledge.py
+8 个接口，覆盖文档管理、反馈、通知三个领域：
+暂时无法在飞书文档外展示此内容
+[图片]
+失败就失败，无需兜底，直接用户通过界面看到失败了，重新上传再触发一次解析即可
+
+# src/api/routers/knowledge.py
+
+from __future__ import annotations
+import os
+import tempfile
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from pydantic import BaseModel
+from loguru import logger
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.config import get_settings
+from src.infra.database import get_db
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.minio_client import upload_file as minio_upload
+from src.agents.knowledge.doc_ingestion import ingest_file, ensure_knowledge_collection
+from src.agents.knowledge.doc_rag import COLLECTION_NAME
+
+settings = get_settings()
+router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
+
+
+def _get_deps():
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    return embedding_model, milvus_client
+
+
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form(..., description="文档类型：guideline/drug_instruction/sop/literature"),
+    category: str = Form("通用", description="所属分类：内科/外科/药剂科/行政等"),
+):
+    """
+    上传文档并导入知识库。
+    支持 PDF、Word、TXT 格式。
+    """
+    allowed_ext = {".pdf", ".docx", ".doc", ".txt", ".md"}
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed_ext:
+        raise HTTPException(400, f"不支持的文件格式: {ext}，支持: {allowed_ext}")
+
+    content = await file.read()
+
+    # 存原始文件到 MinIO
+    minio_key = f"knowledge/{doc_type}/{file.filename}"
+    try:
+        minio_upload(minio_key, content, file.content_type or "application/octet-stream")
+    except Exception as e:
+        logger.warning(f"MinIO 上传失败（不影响索引）: {e}")
+
+    # 写临时文件供 LlamaIndex 解析
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        embedding_model, milvus_client = _get_deps()
+        chunk_count = await ingest_file(
+            file_path=tmp_path,
+            doc_name=file.filename,
+            doc_type=doc_type,
+            category=category,
+            embedding_model=embedding_model,
+            milvus_client=milvus_client,
+        )
+        return {"message": f"文档 '{file.filename}' 导入成功", "chunks": chunk_count}
+    finally:
+        os.unlink(tmp_path)
+
+
+@router.post("/upload/notify")
+async def upload_document_with_notify(
+    file: UploadFile = File(...),
+    doc_type: str = Form(...),
+    category: str = Form("通用"),
+    db: AsyncSession = Depends(get_db),
+):
+    """上传文档并导入知识库，同时发送知识更新通知。"""
+    result = await upload_document(file=file, doc_type=doc_type, category=category)
+
+    from src.agents.knowledge.notification import notify_doc_update
+    try:
+        await notify_doc_update(db, file.filename, doc_type, category, action="upload")
+    except Exception as e:
+        logger.warning(f"发送知识更新通知失败: {e}")
+
+    return result
+
+
+@router.delete("/docs/{doc_name}")
+async def delete_document(doc_name: str):
+    """按文档名删除知识库中的所有分块。"""
+    import hashlib
+    doc_id = hashlib.md5(doc_name.encode()).hexdigest()[:16]
+    _, milvus_client = _get_deps()
+    try:
+        milvus_client.delete(
+            collection_name=COLLECTION_NAME,
+            filter=f'doc_id == "{doc_id}"',
+        )
+        return {"message": f"文档 '{doc_name}' 已删除"}
+    except Exception as e:
+        raise HTTPException(500, f"删除失败: {e}")
+
+
+@router.get("/docs")
+async def list_documents():
+    """列出知识库中所有文档（按 doc_id 去重）。"""
+    _, milvus_client = _get_deps()
+    try:
+        ensure_knowledge_collection(milvus_client)
+        results = milvus_client.query(
+            collection_name=COLLECTION_NAME,
+            filter="chunk_index == 0",
+            output_fields=["doc_id", "doc_name", "doc_type", "category"],
+            limit=500,
+        )
+        docs = [
+            {"doc_name": r["doc_name"], "doc_type": r["doc_type"], "category": r["category"]}
+            for r in results
+        ]
+        return {"documents": docs, "total": len(docs)}
+    except Exception as e:
+        raise HTTPException(500, f"查询失败: {e}")
+
+
+# ── 反馈闭环 ─────────────────────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    user_id: str
+    question: str
+    answer: str
+    rating: int
+    comment: str = ""
+    intent: str = ""
+    channels: str = ""
+
+
+@router.post("/feedback")
+async def submit_feedback(
+    req: FeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """提交知识问答反馈（点赞/踩）。rating: 1=有用, -1=无用"""
+    from src.agents.knowledge.feedback import save_feedback
+    feedback_id = await save_feedback(
+        db=db, user_id=req.user_id, question=req.question,
+        answer=req.answer, rating=req.rating, comment=req.comment,
+        intent=req.intent, channels=req.channels,
+    )
+    return {"feedback_id": feedback_id, "message": "反馈已记录"}
+
+
+@router.get("/feedback/stats")
+async def feedback_stats(db: AsyncSession = Depends(get_db)):
+    """获取知识问答反馈统计。"""
+    from src.agents.knowledge.feedback import get_feedback_stats
+    return await get_feedback_stats(db)
+
+
+# ── 知识更新通知 ──────────────────────────────────────────────────────────
+
+@router.get("/notifications")
+async def list_notifications(
+    category: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取未读的知识更新通知。"""
+    from src.agents.knowledge.notification import get_unread_notifications
+    notifications = await get_unread_notifications(db, category=category)
+    return {"notifications": notifications, "total": len(notifications)}
+
+
+class MarkReadRequest(BaseModel):
+    ids: list[int]
+
+
+@router.post("/notifications/read")
+async def mark_read(
+    req: MarkReadRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """标记通知为已读。"""
+    from src.agents.knowledge.notification import mark_notifications_read
+    await mark_notifications_read(db, req.ids)
+    return {"message": f"已标记 {len(req.ids)} 条通知为已读"}
+
+Step 19：医疗数据初始化
+1. 药品说明书导入（scripts/init_knowledge_docs.py）
+从 PostgreSQL drug_details 表读取已有的药品说明书，批量导入 Milvus。首次部署时运行一次。
+"""
+知识文档索引初始化脚本。
+从 PostgreSQL drug_details 表导入药品说明书到 Milvus knowledge_docs collection。
+
+用法：
+    python scripts/init_knowledge_docs.py
+"""
+
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+from src.core.config import get_settings
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.database import AsyncSessionLocal
+
+settings = get_settings()
+
+
+async def main():
+    print("[INFO] 初始化知识文档索引...")
+
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+
+    async with AsyncSessionLocal() as db:
+        from src.agents.knowledge.doc_ingestion import ingest_drug_instructions
+        total = await ingest_drug_instructions(
+            embedding_model=embedding_model,
+            milvus_client=milvus_client,
+            db_session=db,
+        )
+
+    print(f"[INFO] 初始化完成，共导入 {total} 个分块。")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+2. 公共医学数据集导入（scripts/init_public_datasets.py）
+从 HuggingFace 下载三个公共数据集：
+暂时无法在飞书文档外展示此内容
+支持 --dataset 参数选择性导入，幂等设计（重复运行不产生重复数据）。
+"""
+公共医学数据集初始化脚本。
+从 HuggingFace 下载公共医学数据集，清洗后导入 Milvus 知识库。
+
+用法：
+    # 导入全部数据集
+    python scripts/init_public_datasets.py
+
+    # 只导入指定数据集
+    python scripts/init_public_datasets.py --dataset cmirb
+    python scripts/init_public_datasets.py --dataset dialogue
+    python scripts/init_public_datasets.py --dataset medqa
+
+依赖：
+    pip install datasets
+"""
+
+import asyncio
+import argparse
+import hashlib
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from langchain_community.embeddings import DashScopeEmbeddings
+from pymilvus import MilvusClient
+from loguru import logger
+
+from src.core.config import get_settings
+from src.infra.milvus_client import get_milvus_client_alias
+from src.agents.knowledge.doc_ingestion import ensure_knowledge_collection
+from src.agents.knowledge.doc_rag import COLLECTION_NAME
+
+settings = get_settings()
+BATCH_SIZE = 50
+
+
+def _get_deps():
+    get_milvus_client_alias()
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key="sk-ccd167dc0a7e446e8f5f0f8d45c31a78",
+    )
+    ensure_knowledge_collection(milvus_client)
+    return milvus_client, embedding_model
+
+
+async def _insert_texts(
+    milvus_client: MilvusClient,
+    embedding_model,
+    texts: list[str],
+    doc_id: str,
+    doc_name: str,
+    doc_type: str,
+    category: str,
+) -> int:
+    """批量向量化并写入 Milvus。"""
+    milvus_client.delete(
+        collection_name=COLLECTION_NAME,
+        filter=f'doc_id == "{doc_id}"',
+    )
+
+    all_data = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        embeddings = await embedding_model.aembed_documents(batch)
+        for j, (text_content, emb) in enumerate(zip(batch, embeddings)):
+            idx = i + j
+            all_data.append({
+                "id": f"{doc_id}_{idx}",
+                "doc_id": doc_id,
+                "doc_name": doc_name,
+                "doc_type": doc_type,
+                "category": category,
+                "page_number": 0,
+                "chunk_index": idx,
+                "text": text_content[:65000],
+                "embedding": emb,
+            })
+
+    if all_data:
+        for i in range(0, len(all_data), 1000):
+            milvus_client.insert(
+                collection_name=COLLECTION_NAME,
+                data=all_data[i:i + 1000],
+            )
+    return len(all_data)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据集 1：CMIRB/MedicalRetrieval — 10万条医学检索语料
+# ═══════════════════════════════════════════════════════════════════════
+
+async def download_cmirb(milvus_client, embedding_model):
+    """
+    下载 CMIRB/MedicalRetrieval 数据集并导入 Milvus。
+    包含 ~101K 条中文医学文本，适合作为文档 RAG 的基础语料。
+    """
+    from datasets import load_dataset
+
+    print("[INFO] 下载 CMIRB/MedicalRetrieval 数据集...")
+    ds = load_dataset("CMIRB/MedicalRetrieval", "corpus", split="corpus")
+
+    texts = []
+    for row in ds:
+        text = row.get("text", "") or row.get("content", "")
+        if text and len(text.strip()) > 20:
+            texts.append(text.strip()[:2000])
+
+    print(f"[INFO] CMIRB 共 {len(texts)} 条有效文本，开始向量化...")
+
+    chunk_size = 5000
+    total = 0
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        doc_id = hashlib.md5(f"cmirb_{i}".encode()).hexdigest()[:16]
+        count = await _insert_texts(
+            milvus_client, embedding_model, chunk,
+            doc_id=doc_id,
+            doc_name=f"CMIRB医学检索语料_{i // chunk_size + 1}",
+            doc_type="literature",
+            category="医学文献",
+        )
+        total += count
+        print(f"  [进度] {min(i + chunk_size, len(texts))}/{len(texts)}")
+
+    print(f"[OK] CMIRB 导入完成，共 {total} 条")
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据集 2：Chinese-medical-dialogue-data — 6科室医患对话
+# ═══════════════════════════════════════════════════════════════════════
+
+async def download_med_dialogue(milvus_client, embedding_model):
+    """
+    下载中文医患对话数据集并导入 Milvus。
+    覆盖：男科、内科、妇产科、肿瘤科、儿科、外科。
+    每条记录格式化为"问：xxx 答：xxx"，作为知识文档。
+    """
+    from datasets import load_dataset
+
+    print("[INFO] 下载 Chinese-medical-dialogue-data 数据集...")
+    ds = load_dataset("BillGPT/Chinese-medical-dialogue-data")
+
+    texts = []
+    for split_name in ds:
+        for row in ds[split_name]:
+            q = row.get("ask", "") or row.get("question", "") or ""
+            a = row.get("answer", "") or ""
+            if q and a and len(q) > 5 and len(a) > 10:
+                text = f"问：{q.strip()}\n答：{a.strip()}"
+                texts.append(text[:2000])
+
+    print(f"[INFO] 医患对话共 {len(texts)} 条有效记录，开始向量化...")
+
+    chunk_size = 5000
+    total = 0
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        doc_id = hashlib.md5(f"med_dialogue_{i}".encode()).hexdigest()[:16]
+        count = await _insert_texts(
+            milvus_client, embedding_model, chunk,
+            doc_id=doc_id,
+            doc_name=f"中文医患对话_{i // chunk_size + 1}",
+            doc_type="literature",
+            category="医患对话",
+        )
+        total += count
+        print(f"  [进度] {min(i + chunk_size, len(texts))}/{len(texts)}")
+
+    print(f"[OK] 医患对话导入完成，共 {total} 条")
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据集 3：MedQA — 执业医师考试题（评测用，存到本地文件）
+# ═══════════════════════════════════════════════════════════════════════
+
+async def download_medqa():
+    """
+    下载 MedQA 中文执业医师考试题，保存到 data/eval/ 目录。
+    用于评测知识 Agent 的准确率，不导入 Milvus。
+    """
+    from datasets import load_dataset
+    import json
+
+    print("[INFO] 下载 MedQA 数据集...")
+    ds = load_dataset("bigbio/med_qa", "med_qa_zh_4options_bigbio_qa")
+
+    eval_dir = os.path.join(os.path.dirname(__file__), "..", "data", "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    records = []
+    for split_name in ds:
+        for row in ds[split_name]:
+            question = row.get("question", "")
+            choices = row.get("choices", [])
+            answer = row.get("answer", [])
+            if question:
+                records.append({
+                    "question": question,
+                    "choices": choices,
+                    "answer": answer,
+                    "split": split_name,
+                })
+
+    output_path = os.path.join(eval_dir, "medqa_zh.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] MedQA 保存完成：{output_path}，共 {len(records)} 道题")
+    return len(records)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 主入口
+# ═══════════════════════════════════════════════════════════════════════
+
+async def main():
+    parser = argparse.ArgumentParser(description="公共医学数据集初始化")
+    parser.add_argument(
+        "--dataset",
+        choices=["cmirb", "dialogue", "medqa", "all"],
+        default="all",
+        help="要导入的数据集（默认 all）",
+    )
+    args = parser.parse_args()
+
+    milvus_client, embedding_model = _get_deps()
+
+    if args.dataset in ("cmirb", "all"):
+        await download_cmirb(milvus_client, embedding_model)
+
+    if args.dataset in ("dialogue", "all"):
+        await download_med_dialogue(milvus_client, embedding_model)
+
+    if args.dataset in ("medqa", "all"):
+        await download_medqa()
+
+    print("\n[DONE] 数据集初始化完成！")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+最后：功能测试
+
+# 文档 RAG — 医生角色，回答会更专业
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"doc1","session_id":"s1","message":"阿莫西林的禁忌症有哪些","role":"doctor"}'
+
+# GraphRAG — 查实体关系
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"doc1","session_id":"s2","message":"糖尿病的常用药有哪些"}'
+
+# 多通道融合 — 复杂问题，同时查指南和图谱
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"doc1","session_id":"s3","message":"糖尿病合并肾功能不全的降糖方案怎么选","role":"doctor"}'
+
+# 处方审核 — 药师角色
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"pharma1","session_id":"s4","message":"帮我审核这张处方：阿莫西林0.5g tid + 甲硝唑0.4g bid，患者对青霉素过敏","role":"pharmacist"}'
+
+# NL2SQL — 运营数据查询
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"op1","session_id":"s5","message":"上个月各科室问诊量排名"}'
+
+# 文档上传（带通知）
+curl -X POST http://localhost:8000/api/v1/knowledge/upload/notify \
+  -F "file=@高血压诊疗指南.pdf" -F "doc_type=guideline" -F "category=内科"
+
+# 提交反馈
+curl -X POST http://localhost:8000/api/v1/knowledge/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"doc1","question":"糖尿病常用药","answer":"...","rating":1,"comment":"回答准确"}'
+
+# 查看未读通知
+curl http://localhost:8000/api/v1/knowledge/notifications?category=内科

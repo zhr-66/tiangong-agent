@@ -86,7 +86,9 @@ def create_app() -> FastAPI:
 
     # 注册路由
     from src.api.routers.chat import router as chat_router
+    from src.api.routers.knowledge import router as knowledge_router
     app.include_router(chat_router)
+    app.include_router(knowledge_router)
     # app.include_router(user_router, prefix="/api/v1")
 
 
