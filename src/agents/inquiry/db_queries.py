@@ -1,4 +1,4 @@
-# src/agents/inquiry/db_queries.py
+﻿# src/agents/inquiry/db_queries.py
 
 from __future__ import annotations
 from loguru import logger
@@ -98,6 +98,16 @@ async def save_consultation_record(
 
     try:
         # 查科室 ID（通过科室名查）
+        if patient_id is None:
+            logger.info("无有效患者 ID，跳过保存问诊记录")
+            return None
+
+        patient_result = await db.execute(
+            select(Patient.id).where(Patient.id == patient_id)
+        )
+        if patient_result.scalar_one_or_none() is None:
+            logger.warning(f"患者 ID {patient_id} 不存在，跳过保存问诊记录")
+            return None
         from src.modules.medical.model import Department
         dept_result = await db.execute(
             select(Department).where(Department.name == department_name)
@@ -125,3 +135,4 @@ async def save_consultation_record(
     finally:
         if _own_session:
             await db.close()
+

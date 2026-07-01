@@ -64,7 +64,11 @@ async def node_load_context(state: InquiryState, deps: InquiryDeps) -> dict:
 
     from src.agents.inquiry.db_queries import load_patient_context
     # user_id 即 patients.id，前端传来的是字符串，转 int 后查患者档案
-    patient_id = int(state.patient_context.patient_id) if state.patient_context.patient_id else None
+    # 非整数（如 "user_001"）时降级为 None，按未登录用户处理
+    try:
+        patient_id = int(state.patient_context.patient_id) if state.patient_context.patient_id else None
+    except (ValueError, TypeError):
+        patient_id = None
     # 从HIS查询患者信息和就诊记录
     patient_ctx = await load_patient_context(
         patient_id=patient_id,
@@ -401,8 +405,11 @@ async def node_save_record(state: InquiryState, deps: InquiryDeps) -> dict:
     from src.agents.inquiry.db_queries import save_consultation_record
     payload = state.handoff_payload
     chief_complaint = "、".join(state.confirmed_symptoms[:5])
-    # user_id 即 patients.id，转 int 后写入外键
-    patient_id = int(payload.patient_id) if payload.patient_id else None
+    # user_id 即 patients.id，转 int 后写入外键；非整数时降级为 None
+    try:
+        patient_id = int(payload.patient_id) if payload.patient_id else None
+    except (ValueError, TypeError):
+        patient_id = None
 
     logger.info("节点⑨保存问诊记录 保存问诊记录 | patient_id={} diagnosis={} department={}",
                 patient_id, payload.primary_disease, payload.department)

@@ -1,9 +1,10 @@
-# src/agents/worker_tools.py
+﻿# src/agents/worker_tools.py
 
 from dataclasses import dataclass
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
+from loguru import logger
 
 from src.agents.workers.report_agent import get_report_agent
 from src.agents.workers.drug_agent import get_drug_agent
@@ -52,7 +53,7 @@ async def call_inquiry_agent(message: str, runtime: ToolRuntime) -> str:
     """
     # 获取当前会话 ID 和用户 ID
     user_id, session_id = _parse_thread_id(runtime)
-    print("🔧工具调用 call_inquiry_agent :", session_id, message)
+    logger.info("工具调用 call_inquiry_agent: session={} message={}", session_id, message[:50])
 
     deps = build_inquiry_deps()
 
@@ -151,3 +152,4 @@ WORKER_TOOLS = [
     call_knowledge_agent,
     call_operation_agent,
 ]
+

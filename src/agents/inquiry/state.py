@@ -33,7 +33,7 @@ class CandidateDisease(BaseModel):
 
 # ── 患者上下文（从外部系统加载） ─────────────────────────────────────────
 class PatientContext(BaseModel):
-    patient_id: int | None = None
+    patient_id: str | None = None
     age: int | None = None
     gender: str | None = None                 # "男" / "女"
     allergy_history: list[str] = Field(default_factory=list)
@@ -43,7 +43,7 @@ class PatientContext(BaseModel):
 
 # ── 移交数据包（传给 Inquiry Worker Agent） ──────────────────────────────
 class InquiryHandoffPayload(BaseModel):
-    patient_id: int | None = None
+    patient_id: str | None = None
     patient_context: dict = Field(default_factory=dict)
     confirmed_symptoms: list[str] = Field(default_factory=list)
     denied_symptoms: list[str] = Field(default_factory=list)

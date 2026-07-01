@@ -1,4 +1,7 @@
+import os
 from fastapi import Depends, FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -91,6 +94,16 @@ def create_app() -> FastAPI:
 
 # 创建fastapi 应用
 app = create_app()
+
+# 挂载静态文件目录（前端聊天界面）
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/")
+async def index():
+    """根路由返回聊天界面首页。"""
+    return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 # 健康检查路由； 能访问通，就代表应用启动
 @app.get("/health")

@@ -1,10 +1,11 @@
-# src/api/routers/chat.py
+﻿# src/api/routers/chat.py
 
 from __future__ import annotations
 import json
 import traceback
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
@@ -29,6 +30,122 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     session_id: str
+
+INTERNAL_REPLY_MARKERS = (
+    "## SESSION INTENT",
+    "## SUMMARY",
+    "## ARTIFACTS",
+    "## NEXT STEPS",
+    "SESSION INTENT",
+    "Here is a summary of the conversation to date:",
+)
+
+SAFE_INQUIRY_FALLBACK = (
+    "请描述一下具体症状，包括不舒服的部位、持续多久、严重程度，"
+    "以及是否伴随发热、疼痛、呕吐、胸闷或呼吸困难等情况。"
+)
+
+
+def _content_to_text(content) -> str:
+    """Normalize LangChain message content to displayable plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _has_internal_markers(text: str) -> bool:
+    return any(marker in text for marker in INTERNAL_REPLY_MARKERS)
+
+
+def _is_user_facing_candidate(block: str) -> bool:
+    stripped = block.strip()
+    if not stripped or _has_internal_markers(stripped):
+        return False
+
+    internal_prefixes = (
+        "用户",
+        "助手",
+        "目前",
+        "此前",
+        "None",
+        "1.",
+        "2.",
+        "3.",
+        "- ",
+        "##",
+        "Here is",
+    )
+    if stripped.startswith(internal_prefixes):
+        return False
+
+    forbidden_terms = (
+        "patient_id",
+        "call_inquiry_agent",
+        "工具调用",
+        "参数",
+        "API",
+        "Redis",
+        "SESSION",
+        "ARTIFACTS",
+        "NEXT STEPS",
+    )
+    return not any(term in stripped for term in forbidden_terms)
+
+
+def sanitize_user_reply(text: str) -> str:
+    """
+    Remove checkpoint/summarization/meta text that must never be shown to users.
+
+    Some LangGraph/LangChain middleware can add conversation summaries into the
+    message stream. If those summaries accidentally become assistant content,
+    keep only the last normal user-facing paragraph.
+    """
+    normalized = (text or "").replace("\r\n", "\n").strip()
+    if not normalized:
+        return SAFE_INQUIRY_FALLBACK
+
+    if not _has_internal_markers(normalized):
+        return normalized
+
+    paragraphs = [p.strip() for p in normalized.split("\n\n") if p.strip()]
+    for paragraph in reversed(paragraphs):
+        if _is_user_facing_candidate(paragraph):
+            return paragraph
+
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if _is_user_facing_candidate(line):
+            return line
+
+    return SAFE_INQUIRY_FALLBACK
+
+
+def extract_agent_reply(result: dict) -> str:
+    """Pick the last real assistant message and sanitize it for UI display."""
+    messages = result.get("messages") or []
+    fallback_text = ""
+
+    for msg in reversed(messages):
+        content = _content_to_text(getattr(msg, "content", ""))
+        if not content.strip():
+            continue
+        if isinstance(msg, AIMessage):
+            cleaned = sanitize_user_reply(content)
+            if cleaned:
+                return cleaned
+        fallback_text = content
+
+    return sanitize_user_reply(fallback_text)
 
 
 def _make_keys(user_id: str, session_id: str) -> tuple[str, str]:
@@ -67,7 +184,7 @@ async def _run_inquiry_turn(
         await redis.delete(active_key, state_key)
         if new_state.phase == InquiryPhase.HANDOFF and new_state.handoff_payload:
             handoff_reply = await handle_handoff(new_state.handoff_payload)
-            return f"{reply}\n\n---\n{handoff_reply}"
+            return sanitize_user_reply(f"{reply}\n\n---\n{handoff_reply}")
         return reply
 
     # 问诊继续：更新 Redis 状态，重置 TTL
@@ -105,7 +222,7 @@ async def chat(
             config=config,
             context=UserContext(user_id=req.user_id, session_id=req.session_id),
         )
-        reply = result["messages"][-1].content
+        reply = extract_agent_reply(result)
         return ChatResponse(reply=reply, session_id=req.session_id)
 
     except Exception as e:
@@ -144,22 +261,21 @@ async def chat_stream(
                 yield f"data: {data}\n\n"
 
             else:
-                # ── 无活跃问诊：Supervisor 流式推送 ──
+                # ── 无活跃问诊：Supervisor 先收敛到最终回复，再推送 ──
+                # 防止 SummaryMiddleware / ToolMessage 等内部片段被 SSE 逐字流到前端。
                 agent = await get_supervisor_agent()
                 config = {"configurable": {"thread_id": thread_id}}
-                async for chunk in agent.astream(
+                result = await agent.ainvoke(
                     {"messages": [{"role": "user", "content": req.message}]},
                     config=config,
-                    stream_mode="messages",
-                ):
-                    if isinstance(chunk, tuple):
-                        msg_chunk, _ = chunk
-                        if hasattr(msg_chunk, "content") and msg_chunk.content:
-                            data = json.dumps(
-                                {"type": "token", "content": msg_chunk.content},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {data}\n\n"
+                    context=UserContext(user_id=req.user_id, session_id=req.session_id),
+                )
+                reply = extract_agent_reply(result)
+                data = json.dumps(
+                    {"type": "token", "content": reply},
+                    ensure_ascii=False,
+                )
+                yield f"data: {data}\n\n"
 
             done_data = json.dumps(
                 {"type": "done", "session_id": req.session_id}, ensure_ascii=False
@@ -179,3 +295,6 @@ async def chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+

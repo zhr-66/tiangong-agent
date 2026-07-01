@@ -1,4 +1,4 @@
-# src/agents/inquiry/symptom_normalizer.py
+﻿# src/agents/inquiry/symptom_normalizer.py
 
 from __future__ import annotations
 
@@ -44,6 +44,50 @@ SYMPTOM_EXTRACT_PROMPT = """你是医疗术语标准化专家。
 请提取所有症状并标准化后填入 symptoms 字段。如果没有明确症状，symptoms 填空列表。"""
 
 
+
+
+def _rule_based_symptoms(user_input: str) -> list[str]:
+    """Fallback symptom extraction for models that do not support tool calling."""
+    keyword_groups = [
+        ("发热", ("发烧", "发热", "低烧", "高烧", "体温", "发烫")),
+        ("头痛", ("头疼", "头痛", "偏头痛", "前额痛", "前额胀痛", "脑袋疼")),
+        ("咳嗽", ("咳嗽", "干咳", "咳痰")),
+        ("咽痛", ("嗓子疼", "喉咙疼", "咽痛", "咽喉痛")),
+        ("流涕", ("流鼻涕", "鼻涕", "鼻塞")),
+        ("腹痛", ("肚子疼", "腹痛", "胃疼", "腹部疼痛")),
+        ("腹泻", ("拉肚子", "腹泻", "稀便", "大便不成形")),
+        ("恶心", ("恶心", "想吐", "呕吐")),
+        ("胸痛", ("胸痛", "胸口疼", "前胸痛")),
+        ("呼吸困难", ("呼吸困难", "喘不上气", "气短", "胸闷")),
+        ("乏力", ("乏力", "没力气", "疲惫", "全身无力")),
+        ("心悸", ("心悸", "心慌", "心跳快", "心跳加速")),
+    ]
+    symptoms: list[str] = []
+    for standard_name, keywords in keyword_groups:
+        if any(keyword in user_input for keyword in keywords):
+            symptoms.append(standard_name)
+    return symptoms
+
+
+async def _json_extract_symptoms(user_input: str, llm: BaseChatModel) -> list[str]:
+    """Fallback to normal chat JSON when structured output/tool calling is unavailable."""
+    prompt = (
+        SYMPTOM_EXTRACT_PROMPT.format(user_input=user_input)
+        + '\n\n只输出 JSON，格式为 {"symptoms": ["症状A", "症状B"]}，不要输出解释。'
+    )
+    try:
+        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        content = (response.content or "").strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        parsed = json.loads(content)
+        raw_symptoms = parsed.get("symptoms", []) if isinstance(parsed, dict) else []
+        symptoms = [str(s).strip() for s in raw_symptoms if str(s).strip()]
+        if symptoms:
+            return symptoms
+    except Exception as e:
+        logger.warning(f"LLM JSON 症状提取也失败，使用规则兜底: {e}")
+    return _rule_based_symptoms(user_input)
 async def extract_and_normalize_symptoms(
     user_input: str,
     llm: BaseChatModel,
@@ -63,10 +107,11 @@ async def extract_and_normalize_symptoms(
         logger.debug(f"LLM 提取症状: {symptoms}")
         return symptoms
     except Exception as e:
-        # with_structured_output 在极少数情况下仍可能失败（如模型不支持 function calling）
-        # 此时静默降级，返回空列表，由后续层处理
-        logger.warning(f"LLM 结构化输出失败，降级为空列表: {e}")
-        return []
+        # Some thinking/reasoning models do not support the tool-calling mode used
+        # by with_structured_output. Fall back to plain JSON extraction, then a
+        # small keyword map so the inquiry flow can still continue.
+        logger.warning(f"LLM 结构化输出失败，切换到 JSON/规则兜底: {e}")
+        return await _json_extract_symptoms(user_input, llm)
 
 
 async def match_symptoms_in_neo4j(
@@ -205,3 +250,4 @@ async def humanize_symptoms(
         return result if len(result) == len(symptoms) else symptoms
     except Exception:
         return symptoms
+
