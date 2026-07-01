@@ -1,0 +1,250 @@
+2. 短期记忆系统改造
+1. 为什么需要记忆系统
+LLM 本身是无状态的。每次调用都是全新的，它不记得上一句话说了什么。
+# 没有记忆时的问题
+用户：我叫张三，我最近头痛
+LLM：头痛可能是...（给出建议）
+
+
+用户：我还有发烧
+LLM：发烧可能是...（完全不知道"我"是谁，也不知道之前说过头痛）
+
+要让 LLM 像真正的医生一样问诊，必须给它"记忆"：
+用户：我叫张三，我最近头痛
+LLM：张三您好，头痛可能是...
+
+用户：我还有发烧
+LLM：结合您之前提到的头痛，再加上发烧，需要考虑...（知道上下文了）
+
+
+2. LangChain 记忆系统
+LangChain 使用 LangGraph 底层定义的记忆体系。LangGraph 的记忆体系分两层：
+暂时无法在飞书文档外展示此内容
+- checkpointer：保存 LangGraph 图的执行状态快照（消息列表、中间变量等），让同一个 thread_id 的对话可以续接。如果保存redis，多一次网络IO，系统慢（内网 单次会话的io是ms）。
+- store：保存任意键值数据，支持语义搜索，Agent 可以在工具中主动读写，实现跨会话记忆。
+
+3. 短期记忆：用 Redis 替换 InMemorySaver
+1. 安装依赖
+pip install langgraph-checkpoint-redis langchain-deepseek
+langgraph-checkpoint-redis 提供 RedisSaver（同步）和 AsyncRedisSaver（异步）两个类。
+
+
+
+
+2. 修改 infra/redis_cache.py
+import redis.asyncio as redis
+from src.core.config import get_settings
+
+settings = get_settings()
+
+# 模块级别创建连接池（应用启动时初始化一次）
+redis_pool = redis.ConnectionPool(
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
+    db=settings.REDIS_DB,
+    password=settings.REDIS_PASSWORD or None,
+    decode_responses=True,
+    encoding="utf-8",
+)
+
+# 模块级别创建 Redis 客户端实例（复用连接池）; _ 开头认为是 私有变量，不暴露出去
+_redis_client = redis.Redis(connection_pool=redis_pool)
+
+# RedisSaver（checkpointer）专用连接池：必须 decode_responses=False（bytes 模式）
+# 与业务连接池共享相同的地址配置，但保持独立的连接池，互不干扰
+_checkpointer_pool = redis.ConnectionPool(
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
+    db=settings.REDIS_DB,
+    password=settings.REDIS_PASSWORD or None,
+    decode_responses=False,  # RedisSaver 要求 bytes，不能 decode
+)
+
+_checkpointer_client = redis.Redis(connection_pool=_checkpointer_pool)
+
+
+async def get_redis_client() -> redis.Redis:
+    """
+    FastAPI Depends 注入用。
+    直接返回模块级别的 Redis 客户端实例，不需要每次创建新实例。
+    连接池会自动管理连接的获取和归还。
+    """
+    return _redis_client
+
+
+def get_checkpointer_redis() -> redis.Redis:
+    """
+    返回供 RedisSaver（LangGraph checkpointer）专用的 Redis 客户端。
+    decode_responses=False，以 bytes 模式运行，与业务 Redis 客户端隔离。
+    """
+    return _checkpointer_client
+
+
+
+
+3. 整合 AsyncRedisSaver 异步版本（生产推荐）
+创建 src/agents/supervisor_agent.py
+项目使用 FastAPI 异步框架，推荐用 AsyncRedisSaver：
+from langgraph.checkpoint.redis import AsyncRedisSaver
+from langchain.agents import create_agent
+from langchain_deepseek.chat_models import ChatDeepSeek
+from src.infra.redis_cache import get_checkpointer_redis
+
+
+async def create_supervisor_agent():
+    # 1. 复用项目已有的 checkpointer 专用 Redis 客户端（bytes 模式）
+    redis_client = get_checkpointer_redis()
+
+    # 2. 创建 AsyncRedisSaver，并调用 asetup() 初始化 RediSearch 索引
+    # asetup() 会在 Redis Stack 中创建 checkpoint / checkpoint_write 两个索引
+    # 必须在首次使用前调用一次，索引已存在时自动跳过，可以重复调用
+    checkpointer = AsyncRedisSaver(redis_client=redis_client)
+    await checkpointer.asetup()
+
+    # 3. 创建 Agent
+    llm = ChatDeepSeek(model="deepseek-chat")
+
+    agent = create_agent(
+        model=llm,
+        tools=[],
+        checkpointer=checkpointer,
+    )
+    return agent
+
+
+# 模块级单例：避免每次请求都重新创建 agent 和 checkpointer
+_supervisor_agent = None
+
+
+async def get_supervisor_agent():
+    """返回全局单例 Agent，首次调用时初始化。"""
+    global _supervisor_agent
+    if _supervisor_agent is None:
+        _supervisor_agent = await create_supervisor_agent()
+    return _supervisor_agent
+
+
+# FastAPI 路由中使用
+async def chat_endpoint(user_id: str, session_id: str, message: str):
+    agent = await get_supervisor_agent()  # 使用单例，不重复初始化
+
+    config = {"configurable": {"thread_id": f"{user_id}:{session_id}"}}
+
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]},
+        config=config,
+    )
+    return result["messages"][-1].content
+
+4. 单元测试
+pip install pytest pytest-asyncio
+pytest 默认会搜寻当前目录及子目录中，
+1. 文件名以 test_ 开头或者结尾以 _test.py 的 Python 文件，
+2. 里面函数名以 test_ 开头的函数作为测试函数执行。
+1. 测试配置：pytest.ini
+项目根目录下创建 pytest.ini
+
+[pytest]
+# 让 pytest 从项目根目录启动，src.xxx 的 import 才能解析
+pythonpath = .
+
+# pytest-asyncio 模式：auto 表示所有 async 测试自动识别，无需手动加 @pytest.mark.asyncio
+asyncio_mode = auto
+
+# 测试文件发现目录
+testpaths = test
+
+2. 测试代码
+异步测试
+1. 安装 pytest-asyncio
+2. 用 @pytest.mark.asyncio 标记异步测试函数
+3. 测试函数用 async def，用 await 调用异步代码
+import pytest
+from src.agents.supervisor_agent import chat_endpoint
+
+
+@pytest.mark.asyncio
+async def test_agent_memory():
+    """验证短期记忆：同一 thread_id 下第二轮能记住第一轮的内容"""
+    # 第一轮：自我介绍
+    reply1 = await chat_endpoint("1123", "ATDAAS", "你好，我叫雷丰阳")
+    print(f"\n第一轮回复：{reply1}")
+
+    # 第二轮：考察记忆
+    reply2 = await chat_endpoint("1123", "ATDAAS", "我是谁？")
+    print(f"第二轮回复：{reply2}")
+
+    # 断言：第二轮回复应包含名字
+    assert "雷丰阳" in reply2, f"Agent 应该记住用户名字，实际回复：{reply2}"
+
+5. 修改 docker-compose.yaml 文件
+使用 redis-stack 镜像，内置 RedisJSON / RediSearch 模块
+# ----------------------------------------------------------
+# Redis Stack — 短期记忆
+# 存储：会话级对话上下文，TTL 自动过期
+# 使用 redis-stack 镜像，内置 RedisJSON / RediSearch 模块
+# langgraph-checkpoint-redis 依赖 JSON.SET 命令，标准 redis 镜像不支持
+# Web UI：http://localhost:8001（RedisInsight）
+# ----------------------------------------------------------
+redis:
+  image: redis/redis-stack:7.4.0-v3
+  container_name: tiangong-redis
+  restart: always
+  environment:
+    REDIS_ARGS: "--appendonly yes"
+  volumes:
+    - ./docker/redis_data:/data
+  ports:
+    - "6379:6379"   # Redis 主端口
+    - "8001:8001"   # RedisInsight 可视化 Web UI
+  networks:
+    - tiangong-net
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+6. thread_id 设计
+# 格式：{user_id}:{session_id}
+# 同一用户不同会话互相隔离
+thread_id = f"user_{user_id}:session_{session_id}"
+
+# 例如：
+thread_id = "user_001:session_20240414"
+
+
+
+# 默认情况下 checkpoint key 永不过期。我们建议引入ttl机制
+from datetime import date
+
+# thread_id 加日期，7天后手动清理
+thread_id = f"{user_id}:{session_id}:{date.today().isoformat()}"
+# → "1123:ATDAAS:2025-04-14"
+
+4. 引入 SummarizationMiddleware
+进行消息回话总结。当历史消息量比较大的时候，进行压缩汇总。
+agent = create_agent(
+    model=llm,
+    tools=[],
+    middleware=[
+        SummarizationMiddleware(
+            model="deepseek-chat",
+            trigger=[
+                ("tokens", 4000),  # token数达到4k时触发
+                ("messages", 6)  # 或消息数达到 4条时触发
+            ],
+            keep=("messages", 6),  # 摘要后保留最近 4 条消息
+        )
+    ],
+    checkpointer=checkpointer,
+)
+return agent
+
+
+5. 短期记忆：核心总结
+ 短期记忆（Redis）
+1. 安装 langgraph-checkpoint-redis，用 AsyncRedisSaver(redis_client=client) 替换 InMemorySaver
+2. 调用时传 config={"configurable": {"thread_id": "..."}} 即可，框架自动管理对话历史
+3. decode_responses=False 是必须的，RedisSaver 需要 bytes
+

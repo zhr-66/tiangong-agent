@@ -1,0 +1,2583 @@
+1. 整体数据流与多轮对话设计
+1. 核心设计原则
+什么时候用 LangGraph：只要我们业务是一个确定性的流程，需要多工作流节点构建一个完整工作流，就用LangGraph；
+LangGraph 就是 Coze 中定义的工作流
+LangChain 就是 Coze 中定义的 Agent
+Agent 里面既可以调用工具，也可以调用工作流。工作流本身也可以具有Agent的能力（多轮对话、大模型）
+多轮问诊对话不经过 Supervisor，由 FastAPI 路由层做确定性分流：
+- 无活跃问诊：消息进入 Supervisor，由 LLM 判断意图，首次触发问诊时启动 InquiryGraph
+- 问诊进行中：消息直接进入 InquiryGraph，完全绕过 Supervisor，避免 LLM 路由的不确定性
+
+暂时无法在飞书文档外展示此内容
+
+2. 为什么不让 Supervisor 管理多轮问诊
+Supervisor 是 ReAct Agent，每次收到消息都让 LLM 决定调用哪个工具。
+问诊第 3 轮用户回复"有恶心，没有咳嗽"，LLM 不能保证一定会再次调用 call_inquiry_agent，可能直接自己回答，导致 InquiryState 永远停在第 3 轮。
+
+路由层的判断是查 Redis 键是否存在，是确定性操作，不依赖 LLM。
+
+Step 1：定义诊断状态机 InquiryState
+诊断流程是一个 LangGraph 工作流。
+工作流有很多步骤，每一步就是一个节点。每个节点操作完成都可能导致数据变化。把变化的数据统一保存到一个状态中。问诊状态对象：InquiryState
+1. 解决什么问题
+LangGraph 的 StateGraph 要求所有节点共享同一个状态对象。
+InquiryState 就是问诊过程的"共享黑板"——每个节点从这里读取当前进展，处理完后把更新写回来。没有它，各节点之间无法传递"已确认了哪些症状"、"当前是第几轮"、"候选疾病是什么"等关键信息。
+2. 新建文件
+先创建包目录：
+src/agents/inquiry/__init__.py   （空文件）
+src/agents/inquiry/state.py
+3. 完整代码
+# src/agents/inquiry/state.py
+
+from __future__ import annotations
+from enum import Enum
+from typing import Annotated
+from pydantic import BaseModel, Field
+from langgraph.graph.message import add_messages
+from langchain_core.messages import BaseMessage
+# from langgraph.graph import START,END
+
+# ── 阶段枚举：驱动 LangGraph 路由逻辑 ──────────────────────────────────
+class InquiryPhase(str, Enum):
+    CLARIFY            = "CLARIFY"            # 用户描述模糊，引导澄清
+    GRAPH_QUERY        = "GRAPH_QUERY"        # 有明确症状，查询 Neo4j
+    SYMPTOM_CONFIRM    = "SYMPTOM_CONFIRM"    # 追问候选症状
+    COMPLICATION_CHECK = "COMPLICATION_CHECK" # 追问并发症症状
+    CONCLUDE           = "CONCLUDE"           # 输出诊断结论
+    HANDOFF            = "HANDOFF"            # 移交 Inquiry Worker Agent
+    END                = "__end__"                # 流程结束
+
+
+# ── 候选疾病 ────────────────────────────────────────────────────────────
+class CandidateDisease(BaseModel):
+    name: str
+    confidence: float = 0.0           # 最终置信度（加权后）
+    base_confidence: float = 0.0      # 基础置信度 = 命中症状数 / 总症状数
+    matched_symptoms: list[str] = Field(default_factory=list)
+    all_symptoms: list[str] = Field(default_factory=list)
+    department: str = ""
+    checks: list[str] = Field(default_factory=list)
+    complications: list[str] = Field(default_factory=list)  # ACOMPANY_WITH 关系
+
+
+# ── 患者上下文（从外部系统加载） ─────────────────────────────────────────
+class PatientContext(BaseModel):
+    patient_id: int | None = None
+    age: int | None = None
+    gender: str | None = None                 # "男" / "女"
+    allergy_history: list[str] = Field(default_factory=list)
+    medical_history: list[str] = Field(default_factory=list)     # 既往病史
+    long_term_memories: list[str] = Field(default_factory=list)  # Milvus 长期记忆摘要
+
+
+# ── 移交数据包（传给 Inquiry Worker Agent） ──────────────────────────────
+class InquiryHandoffPayload(BaseModel):
+    patient_id: int | None = None
+    patient_context: dict = Field(default_factory=dict)
+    confirmed_symptoms: list[str] = Field(default_factory=list)
+    denied_symptoms: list[str] = Field(default_factory=list)
+    unmatched_symptoms: list[str] = Field(default_factory=list)
+    primary_disease: str = ""
+    primary_confidence: float = 0.0
+    suspected_diseases: list[str] = Field(default_factory=list)
+    department: str = ""
+    recommended_checks: list[str] = Field(default_factory=list)
+    total_rounds: int = 0
+    session_id: str = ""
+
+
+# ── 主状态对象：在 LangGraph 节点间流转的"黑板" ──────────────────────────
+class InquiryState(BaseModel):
+    # 对话消息历史（add_messages 注解让 LangGraph 自动追加而非覆盖）
+    messages: Annotated[list[BaseMessage], add_messages] = Field(default_factory=list)
+
+    # 流程控制
+    phase: InquiryPhase = InquiryPhase.CLARIFY
+    round: int = 0                    # 当前轮次（1~10）
+    session_id: str = ""
+
+    # 症状追踪
+    confirmed_symptoms: list[str] = Field(default_factory=list) # 确认症状
+    denied_symptoms: list[str] = Field(default_factory=list)  # 否认症状
+    unmatched_symptoms: list[str] = Field(default_factory=list)  # 图谱外症状
+    asked_symptoms: list[str] = Field(default_factory=list)      # 已问过，不重复
+
+    # 诊断推理
+    candidate_diseases: list[CandidateDisease] = Field(default_factory=list)
+
+    # 患者上下文
+    patient_context: PatientContext = Field(default_factory=PatientContext)
+
+    # 结论
+    handoff_payload: InquiryHandoffPayload | None = None
+    force_conclude: bool = False      # True = 达到 10 轮强制结束
+
+    # 节点间临时传递数据
+    pending_ask_symptoms: list[str] = Field(default_factory=list)  # 本轮准备追问的症状
+4. 关键点说明
+- messages 字段使用 add_messages 注解：节点只需 return {"messages": [新消息]}，LangGraph 自动追加，不会覆盖历史。
+- InquiryPhase 枚举驱动路由，避免在 graph.py 里用魔法字符串做 if/else。
+- PatientContext、CandidateDisease、InquiryHandoffPayload 独立成 Pydantic 模型，方便序列化、校验和跨模块传递。
+- asked_symptoms 防止同一个症状被反复追问，影响用户体验。
+
+
+Step 2：症状三层标准化流水线
+1. 解决什么问题
+用户大白话到医疗专业词的映射
+用户说"肚子疼"，Neo4j 里存的是"腹痛"。直接查会漏掉大量症状，导致候选疾病召回严重不足（预计只有 ~60% 召回率）。本模块实现三层兜底：
+[图片]
+2. 完整代码
+# src/agents/inquiry/symptom_normalizer.py
+
+from __future__ import annotations
+
+import json
+from loguru import logger
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.embeddings import Embeddings
+from neo4j import AsyncDriver
+from pymilvus import MilvusClient
+
+# ── 第一层：结构化输出模型 ────────────────────────────────────────────────
+class SymptomsOutput(BaseModel):
+    """LLM 结构化输出的 Schema。with_structured_output 会强制 LLM 按此格式返回。"""
+    symptoms: list[str] = Field(
+        description="从用户描述中提取并标准化后的医学症状术语列表，无症状时为空列表"
+    )
+
+
+# ── 第一层 Prompt ────────────────────────────────────────────────────────
+SYMPTOM_EXTRACT_PROMPT = """你是医疗术语标准化专家。
+
+任务：从用户的描述中提取所有症状，并将每个症状转换为标准医学术语。
+
+标准化规则（不限于此，尽量标准化）：
+- 发烧/烧/低烧/高烧 → 发热
+- 肚子疼/肚痛/腹部疼痛/肚子不舒服 → 腹痛
+- 头晕/头晕眼花/天旋地转 → 眩晕
+- 喘不上气/憋气/气短/胸闷喘气 → 呼吸困难
+- 拉肚子/跑肚/稀便/大便不成形 → 腹泻
+- 心跳快/心慌/心跳加速/心跳不规律 → 心悸
+- 浑身没劲/没力气/疲惫/全身乏力 → 乏力
+- 嗓子疼/喉咙疼/咽喉痛 → 咽痛
+- 胸口疼/胸部疼痛/前胸痛 → 胸痛
+- 恶心想吐/想呕吐/胃部不适 → 恶心
+- 头疼/头部疼痛/偏头痛 → 头痛
+- 流鼻涕/鼻涕/鼻塞流涕 → 流涕
+- 咳嗽/干咳/咳痰 → 咳嗽
+
+用户描述：{user_input}
+
+请提取所有症状并标准化后填入 symptoms 字段。如果没有明确症状，symptoms 填空列表。"""
+
+
+async def extract_and_normalize_symptoms(
+    user_input: str,
+    llm: BaseChatModel,
+) -> list[str]:
+    """
+    第一层：LLM 提取 + 标准化。
+    使用 with_structured_output 强制 LLM 按 SymptomsOutput Schema 返回，
+    无需手动解析 JSON，彻底消除格式错误风险。
+    """
+    structured_llm = llm.with_structured_output(SymptomsOutput)
+    prompt = SYMPTOM_EXTRACT_PROMPT.format(user_input=user_input)
+    try:
+        result: SymptomsOutput = await structured_llm.ainvoke(
+            [SystemMessage(content=prompt)]
+        )
+        symptoms = [s.strip() for s in result.symptoms if s.strip()]
+        logger.debug(f"LLM 提取症状: {symptoms}")
+        return symptoms
+    except Exception as e:
+        # with_structured_output 在极少数情况下仍可能失败（如模型不支持 function calling）
+        # 此时静默降级，返回空列表，由后续层处理
+        logger.warning(f"LLM 结构化输出失败，降级为空列表: {e}")
+        return []
+
+
+async def match_symptoms_in_neo4j(
+    symptoms: list[str],
+    neo4j_driver: AsyncDriver,
+) -> tuple[list[str], list[str]]:
+    """第二层：Neo4j 精确匹配。返回 (命中列表, 未命中列表)。"""
+    if not symptoms:
+        return [], []
+    async with neo4j_driver.session() as session:
+        result = await session.run(
+            "MATCH (s:Symptom) WHERE s.name IN $names RETURN s.name AS name",
+            names=symptoms,
+        )
+        records = await result.data()
+        matched_set = {r["name"] for r in records}
+    matched = [s for s in symptoms if s in matched_set]
+    unmatched = [s for s in symptoms if s not in matched_set]
+    logger.debug(f"Neo4j 精确匹配: 命中={matched}, 未命中={unmatched}")
+    return matched, unmatched
+
+
+SIMILARITY_THRESHOLD = 0.85  # 低于此值视为真正的图谱外症状
+
+
+async def semantic_match_symptoms(
+    unmatched_symptoms: list[str],
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+) -> tuple[dict[str, str], list[str]]:
+    """
+    第三层：Milvus 语义相似度兜底。
+    返回 (mapped={用户原词: 图谱标准词}, still_unmatched=真正图谱外症状)。
+    """
+    if not unmatched_symptoms:
+        return {}, []
+    # 批量向量化，减少 API 调用次数
+    query_embeddings = await embedding_model.aembed_documents(unmatched_symptoms)
+    mapped: dict[str, str] = {}
+    still_unmatched: list[str] = []
+    for symptom, query_vec in zip(unmatched_symptoms, query_embeddings):
+        try:
+            results = milvus_client.search(
+                collection_name="symptom_index",
+                data=[query_vec],
+                limit=1,
+                output_fields=["name"],
+            )
+            if results and results[0]:
+                top_hit = results[0][0]
+                score = top_hit["distance"]  # COSINE 相似度，越高越相似
+                if score >= SIMILARITY_THRESHOLD:
+                    std_name = top_hit["entity"]["name"]
+                    mapped[symptom] = std_name
+                    logger.debug(f"语义映射: '{symptom}' → '{std_name}' (score={score:.3f})")
+                else:
+                    still_unmatched.append(symptom)
+            else:
+                still_unmatched.append(symptom)
+        except Exception as e:
+            logger.warning(f"Milvus 语义匹配失败 '{symptom}': {e}")
+            still_unmatched.append(symptom)
+    return mapped, still_unmatched
+
+
+async def normalize_symptoms(
+    user_input: str,
+    llm: BaseChatModel,
+    neo4j_driver: AsyncDriver,
+    embedding_model: Embeddings,
+    milvus_client: MilvusClient,
+) -> dict:
+    """
+    完整三层症状标准化流水线入口。
+
+    Returns:
+        matched      : 直接命中 Neo4j 的标准症状列表
+        mapped       : {用户原词: 图谱标准词}，语义兜底后的映射
+        unmatched    : 真正的图谱外症状（供医生参考）
+        all_standard : matched + mapped.values()，用于后续 Neo4j 查询
+    """
+    normalized = await extract_and_normalize_symptoms(user_input, llm)
+    if not normalized:
+        return {"matched": [], "mapped": {}, "unmatched": [], "all_standard": []}
+
+    matched, unmatched_after_exact = await match_symptoms_in_neo4j(normalized, neo4j_driver)
+    mapped, still_unmatched = await semantic_match_symptoms(
+        unmatched_after_exact, embedding_model, milvus_client
+    )
+    all_standard = matched + list(mapped.values())
+    return {
+        "matched": matched,
+        "mapped": mapped,
+        "unmatched": still_unmatched,
+        "all_standard": all_standard,
+    }
+
+
+# ── 反向处理：标准术语 → 口语（追问时使用） ──────────────────────────────
+SYMPTOM_HUMANIZE_PROMPT = """将以下医学症状术语转换为患者容易理解的口语表达。
+
+症状列表：{symptoms}
+
+要求：
+- 简洁易懂，避免专业术语
+- 可以加括号补充解释，帮助患者理解
+- 输出 JSON 数组，与输入顺序一一对应
+
+示例：
+输入：["发热", "心悸", "呼吸困难"]
+输出：["发烧", "心跳加速或心慌", "喘不上气或胸闷"]"""
+
+
+async def humanize_symptoms(
+    symptoms: list[str],
+    llm: BaseChatModel,
+) -> list[str]:
+    """
+    将标准医学术语转换为患者易懂的口语（用于追问时的友好表达）。
+    失败时静默降级，直接返回原术语，不影响主流程。
+    """
+    if not symptoms:
+        return []
+    prompt = SYMPTOM_HUMANIZE_PROMPT.format(
+        symptoms=json.dumps(symptoms, ensure_ascii=False)
+    )
+    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        result = json.loads(content.strip())
+        # 长度不一致说明 LLM 输出有问题，退回原词
+        return result if len(result) == len(symptoms) else symptoms
+    except Exception:
+        return symptoms
+3. 关键点说明
+- 三层串联而非并联：必须先 LLM 标准化，才能做 Neo4j 精确匹配，再把漏网的送 Milvus。
+- with_structured_output(SymptomsOutput) 底层使用模型的 function calling / tool use 能力，LLM 被强制按 SymptomsOutput 的 Schema 返回，框架自动完成反序列化，彻底消除手动解析 JSON 的格式错误风险。
+- SymptomsOutput 的 Field(description=...) 会被注入到发给模型的 Schema 描述中，相当于给模型额外的字段级说明，提升提取准确率。
+- aembed_documents 批量处理多个症状，比循环调用 aembed_query 少一次网络往返。
+- humanize_symptoms 失败时静默降级返回原词，追问功能不会因此中断。
+- SIMILARITY_THRESHOLD = 0.85 是经验值，过低会把不相关词映射进来，过高会漏掉有效词。
+
+
+4. 未来优化方向
+- 在 Redis 中缓存 {症状原词: 标准词} 热词映射，命中缓存后跳过 LLM，节省 ~500ms。
+  - 查询到标准词的直接用，查不到的走Milvus；
+- SIMILARITY_THRESHOLD 可按疾病领域动态调整（罕见病领域调低到 0.80）
+
+
+Step 3：初始化 Milvus 症状向量索引
+1. 解决什么问题
+Step 2 第三层的语义匹配依赖一个 Milvus collection symptom_index，里面存储了 Neo4j 中所有 Symptom 节点的向量表示。这个 collection 不会自动存在，需要在首次部署时执行一次初始化脚本来构建。之后每次 Neo4j 新增症状节点时，也需要增量更新。
+2. 新建文件
+scripts/init_symptom_index.py
+3. 完整代码
+# scripts/init_symptom_index.py
+"""
+症状向量索引初始化脚本。
+首次部署时执行一次，之后 Neo4j 新增症状时增量执行。
+
+用法：
+    python scripts/init_symptom_index.py
+"""
+
+import asyncio
+import sys
+import os
+
+from langchain_community.embeddings import DashScopeEmbeddings
+
+# 把项目根目录加入 Python 路径，确保能 import src 下的模块
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from pymilvus import (
+    connections, Collection, CollectionSchema,
+    FieldSchema, DataType, utility, MilvusClient
+)
+from neo4j import AsyncGraphDatabase
+from src.core.config import get_settings
+
+settings = get_settings()
+
+COLLECTION_NAME = "symptom_index"
+EMBEDDING_DIM = 1024  # text-embedding-v3 维度，与 MilvusStore 保持一致
+MILVUS_ALIAS = "symptom_init"
+
+
+def ensure_symptom_collection(alias: str) -> Collection:
+    """
+    确保 symptom_index collection 存在。
+    已存在则直接返回，不存在则创建 Schema + 向量索引。
+    """
+    if utility.has_collection(COLLECTION_NAME, using=alias):
+        print(f"[INFO] collection '{COLLECTION_NAME}' 已存在，跳过创建。")
+        col = Collection(COLLECTION_NAME, using=alias)
+        col.load()
+        return col
+
+    fields = [
+        # 用症状名作为主键，天然去重，更新时直接 upsert
+        FieldSchema(name="id",        dtype=DataType.VARCHAR, max_length=256, is_primary=True),
+        FieldSchema(name="name",      dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
+    ]
+    schema = CollectionSchema(fields, description="Neo4j Symptom nodes vector index")
+    col = Collection(COLLECTION_NAME, schema=schema, using=alias)
+    col.create_index(
+        field_name="embedding",
+        index_params={
+            "metric_type": "COSINE",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": 128},
+        },
+    )
+    col.load()
+    print(f"[INFO] collection '{COLLECTION_NAME}' 创建成功。")
+    return col
+
+
+async def fetch_all_symptoms(neo4j_driver) -> list[str]:
+    """从 Neo4j 取出所有 Symptom 节点的名称。"""
+    async with neo4j_driver.session() as session:
+        result = await session.run("MATCH (s:Symptom) RETURN s.name AS name")
+        records = await result.data()
+    names = [r["name"] for r in records if r["name"]]
+    print(f"[INFO] 从 Neo4j 获取到 {len(names)} 个症状节点。")
+    return names
+
+
+def get_embedding_model():
+    """
+    返回 Embedding 模型实例。
+    项目使用 DeepSeek 兼容的 OpenAI 接口 + text-embedding-v3。
+    """
+    return DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+
+
+async def build_symptom_index():
+    """主流程：全量构建症状向量索引。"""
+    # 1. 连接 Milvus
+    connections.connect(
+        alias=MILVUS_ALIAS,
+        host=settings.MILVUS_HOST,
+        port=settings.MILVUS_PORT,
+    )
+    col = ensure_symptom_collection(MILVUS_ALIAS)
+
+    # 2. 连接 Neo4j，获取所有症状名
+    neo4j_driver = AsyncGraphDatabase.driver(
+        settings.NEO4J_URI,
+        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+    )
+    symptom_names = await fetch_all_symptoms(neo4j_driver)
+    await neo4j_driver.close()
+
+    if not symptom_names:
+        print("[WARN] Neo4j 中没有 Symptom 节点，请先导入医疗数据。")
+        return
+
+    # 3. 批量向量化（每批 100 个，避免单次请求过大）
+    embedding_model = get_embedding_model()
+    batch_size = 100
+    all_data = []
+    for i in range(0, len(symptom_names), batch_size):
+        batch = symptom_names[i: i + batch_size]
+        embeddings = await embedding_model.aembed_documents(batch)
+        for name, emb in zip(batch, embeddings):
+            all_data.append({"id": name, "name": name, "embedding": emb})
+        print(f"[INFO] 已向量化 {min(i + batch_size, len(symptom_names))}/{len(symptom_names)}")
+
+    # 4. 写入 Milvus（upsert 语义：先删同名旧记录，再插入）
+    # pymilvus 的 Collection.upsert 在 v2.x 中等价于 delete + insert
+    col.upsert(all_data)
+    col.flush()
+    print(f"[INFO] 症状索引构建完成，共写入 {len(all_data)} 条记录。")
+
+    # 5. 断开连接
+    connections.disconnect(alias=MILVUS_ALIAS)
+
+
+if __name__ == "__main__":
+    asyncio.run(build_symptom_index())
+执行初始化：python scripts/init_symptom_index.py
+[图片]
+
+4. 关键设计说明
+- 用症状名（name）作为 Milvus 主键，天然去重，重复执行脚本不会产生重复数据。
+- 分批向量化（每批 100 个）避免单次请求体过大导致 API 超时。
+- col.load() 必须在查询前调用，否则 Milvus 不会把索引加载到内存，查询会报错。
+
+5. 未来优化方向
+- 增量更新：监听 Neo4j 变更事件（或定时对比），只对新增症状做 upsert，不重建全量索引。
+  - 怎么监听 Neo4j 的变化，然后增量更新 Milvus？
+  - 唯一性原则
+[图片]
+
+- 多语言支持：如果未来需要支持英文症状，可以在同一 collection 里加 lang 字段做过滤。
+
+
+Step 4：Neo4j 图谱查询封装
+1. 解决什么问题
+问诊流程中需要多次查询 Neo4j：查候选疾病、查待追问症状、查并发症、查科室和检查项目。把这些 Cypher 查询集中封装在一个模块里，避免在 graph.py 里散落大量 Cypher 字符串，也方便单独测试。
+2. 新建文件
+src/agents/inquiry/neo4j_queries.py
+3. 完整代码
+# src/agents/inquiry/neo4j_queries.py
+
+from __future__ import annotations
+from loguru import logger
+from neo4j import AsyncDriver
+from src.agents.inquiry.state import CandidateDisease
+
+
+async def query_candidate_diseases(
+    confirmed_symptoms: list[str],
+    neo4j_driver: AsyncDriver,
+    top_k: int = 10,
+) -> list[CandidateDisease]:
+    """
+    根据已确认症状列表，从 Neo4j 查询候选疾病。
+    按基础置信度（命中症状数 / 该疾病总症状数）降序排列，取 Top K。
+    """
+    if not confirmed_symptoms:
+        return []
+
+    cypher = """
+    MATCH (d:Disease)-[:HAS_SYMPTOM]->(s:Symptom)
+    WHERE s.name IN $confirmed_symptoms
+    WITH d, collect(s.name) AS matched_symptoms, count(s) AS matched_count
+    MATCH (d)-[:HAS_SYMPTOM]->(all_s:Symptom)
+    WITH d, matched_symptoms, matched_count, count(all_s) AS total_symptoms
+    ORDER BY toFloat(matched_count) / total_symptoms DESC
+    LIMIT $top_k
+    RETURN
+        d.name AS disease,
+        matched_symptoms,
+        matched_count,
+        total_symptoms,
+        toFloat(matched_count) / total_symptoms AS base_confidence
+    """
+
+    async with neo4j_driver.session() as session:
+        result = await session.run(
+            cypher,
+            confirmed_symptoms=confirmed_symptoms,
+            top_k=top_k,
+        )
+        records = await result.data()
+
+    candidates = []
+    for r in records:
+        candidates.append(CandidateDisease(
+            name=r["disease"],
+            base_confidence=round(r["base_confidence"], 4),
+            confidence=round(r["base_confidence"], 4),  # 初始值，后续加权调整
+            matched_symptoms=r["matched_symptoms"],
+            all_symptoms=[],   # 由 enrich_candidate_details 补充
+            department="",
+            checks=[],
+            complications=[],
+        ))
+
+    logger.debug(f"Neo4j 候选疾病: {[c.name for c in candidates]}")
+    return candidates
+
+
+async def enrich_candidate_details(
+    candidates: list[CandidateDisease],
+    neo4j_driver: AsyncDriver,
+) -> list[CandidateDisease]:
+    """
+    补充候选疾病的完整信息：全部症状、建议科室、建议检查、并发症。
+    在首次查到候选疾病后调用一次，后续轮次复用缓存在 state 里的数据。
+    """
+    if not candidates:
+        return candidates
+
+    disease_names = [c.name for c in candidates]
+
+    # 查全部症状
+    symptoms_cypher = """
+    MATCH (d:Disease)-[:HAS_SYMPTOM]->(s:Symptom)
+    WHERE d.name IN $names
+    RETURN d.name AS disease, collect(s.name) AS symptoms
+    """
+    # 查科室
+    dept_cypher = """
+    MATCH (d:Disease)-[:BELONGS_TO]->(dept:Department)
+    WHERE d.name IN $names
+    RETURN d.name AS disease, dept.name AS department
+    """
+    # 查检查项目
+    check_cypher = """
+    MATCH (d:Disease)-[:NEED_CHECK]->(c:Check)
+    WHERE d.name IN $names
+    RETURN d.name AS disease, collect(c.name) AS checks
+    """
+    # 查并发症
+    comp_cypher = """
+    MATCH (d:Disease)-[:ACOMPANY_WITH]->(comp:Disease)
+    WHERE d.name IN $names
+    RETURN d.name AS disease, collect(comp.name) AS complications
+    """
+
+    async with neo4j_driver.session() as session:
+        symptoms_result = await (await session.run(symptoms_cypher, names=disease_names)).data()
+        dept_result     = await (await session.run(dept_cypher,     names=disease_names)).data()
+        check_result    = await (await session.run(check_cypher,    names=disease_names)).data()
+        comp_result     = await (await session.run(comp_cypher,     names=disease_names)).data()
+
+    # 构建查找字典
+    symptoms_map    = {r["disease"]: r["symptoms"]      for r in symptoms_result}
+    dept_map        = {r["disease"]: r["department"]    for r in dept_result}
+    check_map       = {r["disease"]: r["checks"]        for r in check_result}
+    comp_map        = {r["disease"]: r["complications"] for r in comp_result}
+
+    for c in candidates:
+        c.all_symptoms  = symptoms_map.get(c.name, [])
+        c.department    = dept_map.get(c.name, "")
+        c.checks        = check_map.get(c.name, [])
+        c.complications = comp_map.get(c.name, [])
+
+    return candidates
+
+
+async def get_pending_symptoms(
+    candidates: list[CandidateDisease],
+    confirmed_symptoms: list[str],
+    denied_symptoms: list[str],
+    asked_symptoms: list[str],
+) -> list[tuple[str, int]]:
+    """
+    从候选疾病的症状集合中，提取尚未确认/否认/追问过的症状。
+    返回 [(症状名, 出现在几个候选疾病中)]，按出现次数升序排列。
+    出现次数越少 = 区分度越高，优先追问。
+    """
+    already_known = set(confirmed_symptoms) | set(denied_symptoms) | set(asked_symptoms)
+    symptom_count: dict[str, int] = {}
+    for c in candidates:
+        for s in c.all_symptoms:
+            if s not in already_known:
+                symptom_count[s] = symptom_count.get(s, 0) + 1
+
+    # 区分度高（出现次数少）的排前面
+    sorted_symptoms = sorted(symptom_count.items(), key=lambda x: x[1])
+    return sorted_symptoms
+4. 关键设计说明
+- query_candidate_diseases 和 enrich_candidate_details 分开：首轮查到候选疾病后，详情只需补充一次，后续轮次直接用 state 里缓存的数据，减少 Neo4j 查询次数。
+- get_pending_symptoms 按"出现在几个候选疾病中"升序排列，出现次数越少说明区分度越高，优先追问能更快缩小候选范围。
+- 四个 Cypher 查询在同一个 session 内串行执行，未来可改为 asyncio.gather 并发执行提升速度。
+  - asyncio == java中的juc == CompletableFuture.allOf/anyOf/....
+5. 未来优化方向
+- 四个 enrich 查询可以合并成一个多 OPTIONAL MATCH 的 Cypher，减少网络往返。
+- 对高频疾病的详情（症状、科室、检查）可以在应用启动时预热到 Redis，查询时直接命中缓存。
+
+Step 5：置信度计算与收敛判断
+1. 解决什么问题
+Neo4j 返回的基础置信度只考虑了"命中症状数/总症状数"，没有结合患者的既往病史、长期记忆、年龄性别等上下文。本模块实现加权调整逻辑，并判断是否达到收敛条件（可以输出结论了）。
+2. 新建文件
+src/agents/inquiry/confidence.py
+3. 完整代码
+# src/agents/inquiry/confidence.py
+
+from __future__ import annotations
+from src.agents.inquiry.state import CandidateDisease, PatientContext
+
+
+def apply_context_weights(
+    candidates: list[CandidateDisease],
+    patient_context: PatientContext,
+    denied_symptoms: list[str],
+) -> list[CandidateDisease]:
+    """
+    在基础置信度上叠加上下文权重，返回重新排序后的候选疾病列表。
+
+    权重规则（来自设计文档）：
+      +0.15  用户有该疾病的既往病史（PostgreSQL medical_history）
+      +0.10  长期记忆中有相关记录（Milvus long_term_memories）
+      +0.05  用户年龄/性别与该疾病易感人群匹配（Patient 表 easy_get 字段）
+      -0.20  用户明确否认该疾病的核心症状
+             （核心症状 = 只属于该疾病、不属于其他候选疾病的独有症状）
+    """
+    # 计算每个症状出现在几个候选疾病中（用于判断"核心症状"）
+    symptom_disease_count: dict[str, int] = {}
+    for c in candidates:
+        for s in c.all_symptoms:
+            symptom_disease_count[s] = symptom_disease_count.get(s, 0) + 1
+
+    for c in candidates:
+        score = c.base_confidence
+
+        # +0.15 既往病史命中
+        for history_item in patient_context.medical_history:
+            if c.name in history_item:
+                score += 0.15
+                break
+
+        # +0.10 长期记忆命中
+        for memory in patient_context.long_term_memories:
+            if c.name in memory:
+                score += 0.10
+                break
+
+        # +0.05 易感人群匹配（简化实现：暂用年龄段粗匹配，后续可接 easy_get 字段）
+        # 此处预留接口，实际匹配逻辑需结合 Disease.easy_get 字段内容
+        # score += 0.05  # 暂时注释，等 easy_get 字段接入后启用
+
+        # -0.20 核心症状被否认
+        # 核心症状 = 只属于该疾病（symptom_disease_count == 1）且被用户否认
+        for s in c.all_symptoms:
+            if s in denied_symptoms and symptom_disease_count.get(s, 0) == 1:
+                score -= 0.20
+                break  # 一个核心症状被否认就扣分，不叠加
+
+        # 置信度限制在 [0, 1]
+        c.confidence = round(max(0.0, min(1.0, score)), 4)
+
+    # 按最终置信度降序排列
+    candidates.sort(key=lambda x: x.confidence, reverse=True)
+    return candidates
+
+
+def check_convergence(
+    candidates: list[CandidateDisease],
+    current_round: int,
+    max_rounds: int = 10,
+) -> tuple[bool, bool]:
+    """
+    判断问诊是否可以收敛（输出结论）。
+
+    Returns:
+        (should_conclude, force_conclude)
+        should_conclude : True = 可以输出结论
+        force_conclude  : True = 是因为达到轮次上限被迫结束（需在结论中标注"信息不足"）
+    """
+    # 达到轮次上限，强制结束
+    if current_round >= max_rounds:
+        return True, True
+
+    if not candidates:
+        return False, False
+
+    top1 = candidates[0].confidence
+
+    # 条件1：Top1 置信度 ≥ 70%
+    if top1 >= 0.70:
+        return True, False
+
+    # 条件2：Top1 与 Top2 置信度差值 ≥ 30%（Top1 明显领先）
+    if len(candidates) >= 2:
+        top2 = candidates[1].confidence
+        if top1 - top2 >= 0.30:
+            return True, False
+
+    return False, False
+4. 关键设计说明
+- "核心症状"定义为只属于该疾病的独有症状（symptom_disease_count == 1）。
+  - 被否认时扣 0.20，但只扣一次，不叠加。
+- 收敛有两个条件：
+  - 置信度绝对值 ≥ 70%，
+  - 或 Top1 与 Top2 差距 ≥ 30%（后者处理"虽然绝对值不高但已经明显领先"的情况）。
+- +0.05 易感人群匹配暂时注释，等 Disease.easy_get 字段的 NLP 解析接入后启用。
+
+Step 6：所有 LLM Prompt 模板
+1. 解决什么问题
+问诊流程中有多处需要调用 LLM：澄清模糊描述、生成追问话术、解析用户回答（确认/否认了哪些症状）、生成最终结论文案。把所有 Prompt 集中在一个文件里，方便统一调整和 A/B 测试。
+2. 新建文件
+src/agents/inquiry/prompts.py
+3. 完整代码
+# src/agents/inquiry/prompts.py
+
+# ── 1. 澄清模糊描述 ──────────────────────────────────────────────────────
+CLARIFY_PROMPT = """你是天宫医疗的智能问诊助手，正在帮助患者描述症状。
+
+患者说：{user_input}
+
+患者的描述比较模糊，没有明确的症状信息。请用温和、易懂的语言引导患者进一步描述，
+重点询问以下方面（每次最多问 2 个方面，不要一次问太多）：
+- 不舒服的具体部位（头、胸、腹、四肢等）
+- 症状的性质（疼痛/酸胀/发热/恶心等）
+- 持续时间（几天了？）
+- 严重程度（轻微/中等/严重）
+
+直接输出追问内容，语气亲切，不要有多余的开场白。"""
+
+
+# ── 2. 生成追问话术 ──────────────────────────────────────────────────────
+ASK_SYMPTOMS_PROMPT = """你是天宫医疗的智能问诊助手。
+
+根据患者已描述的症状，我需要进一步确认以下症状是否存在：
+{symptoms_to_ask}
+
+请将上述症状转化为自然、口语化的追问语句，要求：
+- 一次最多问 3 个症状
+- 语气温和，像医生问诊一样
+- 用患者能理解的口语表达（不用专业术语）
+- 告诉患者"有的说有，没有的不用说"
+
+直接输出追问内容，不要有多余的开场白。"""
+
+
+# ── 3. 解析用户回答（确认/否认了哪些症状） ──────────────────────────────
+PARSE_ANSWER_PROMPT = """你是医疗信息提取专家。
+
+我们刚才询问了患者以下症状是否存在：
+{asked_symptoms}
+
+患者的回答是：
+{user_answer}
+
+请分析患者的回答，判断每个症状的状态：
+- confirmed：患者明确表示有这个症状
+- denied：患者明确表示没有这个症状
+- unknown：患者没有提到或表述不清
+
+以 JSON 格式输出，格式如下：
+{{
+  "confirmed": ["症状A", "症状B"],
+  "denied": ["症状C"],
+  "unknown": ["症状D"]
+}}
+
+只输出 JSON，不要解释。"""
+
+
+# ── 4. 生成诊断结论文案 ──────────────────────────────────────────────────
+CONCLUSION_PROMPT = """你是天宫医疗的智能问诊助手，请根据以下问诊结果，生成一段清晰、友好的诊断结论。
+
+问诊结果：
+- 已确认症状：{confirmed_symptoms}
+- 主要诊断：{primary_disease}（置信度：{confidence:.0%}）
+- 疑似疾病：{suspected_diseases}
+- 建议就诊科室：{department}
+- 建议检查项目：{checks}
+- 是否信息不足（达到轮次上限）：{force_conclude}
+
+要求：
+1. 先简要总结患者的症状
+2. 说明最可能的诊断及原因
+3. 如果有疑似疾病，简要提及
+4. 给出就诊建议（科室 + 检查）
+5. 如果 force_conclude=True，加上"由于信息有限，以上仅供参考，建议就诊后由医生进一步确认"
+6. 最后询问：是否现在预约挂号？
+
+语气温和专业，避免引起患者恐慌。直接输出结论内容。"""
+
+
+# ── 5. 急症识别 ──────────────────────────────────────────────────────────
+EMERGENCY_CHECK_PROMPT = """判断以下用户描述是否包含急症关键词。
+
+用户描述：{user_input}
+
+急症关键词包括（不限于）：
+胸痛、胸闷、心跳停止、呼吸困难、喘不上气、大量出血、意识不清、昏迷、
+中风、偏瘫、突然失语、剧烈头痛、高热抽搐、严重过敏、休克
+
+如果包含急症关键词，输出：{{"is_emergency": true, "reason": "具体原因"}}
+如果不包含，输出：{{"is_emergency": false, "reason": ""}}
+
+只输出 JSON，不要解释。"""
+4. 关键设计说明
+- PARSE_ANSWER_PROMPT 是整个流程中最关键的 Prompt：它把用户的自然语言回答（"头痛有，发烧没有"）解析成结构化的确认/否认列表，驱动状态机更新。
+- EMERGENCY_CHECK_PROMPT 在第一轮就执行，识别到急症立即跳过完整流程，直接输出急诊建议。
+- 所有 Prompt 都用 {变量} 占位符，在 graph.py 里用 .format() 填充，保持 Prompt 文件纯净。
+5. 未来优化方向
+- PARSE_ANSWER_PROMPT 可以改用 with_structured_output 配合 Pydantic 模型，比解析 JSON 字符串更稳定。
+- 可以为不同年龄段的患者（老人/儿童）准备不同语气的 Prompt 变体，提升体验。
+
+
+Step 7：PostgreSQL 历史记录查询
+1. 解决什么问题
+问诊开始时需要加载患者的历史数据：既往病史、过敏史（来自 patients 表），以及近期问诊记录（来自 consultations 表）。这些数据用于置信度加权，避免重复询问患者已知信息。
+这个数据库其实是医院 HIS 系统里面的数据。
+2. 新建文件
+src/agents/inquiry/db_queries.py
+3. 完整代码
+# src/agents/inquiry/db_queries.py
+
+from __future__ import annotations
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+from src.modules.medical.model import Patient, Consultation
+from src.agents.inquiry.state import PatientContext
+
+
+async def load_patient_context(
+    patient_id: int | None,
+    db: AsyncSession | None = None,
+    recent_consultations_limit: int = 5,
+) -> PatientContext:
+    """
+    从 PostgreSQL 加载患者上下文：基本信息 + 近期问诊记录。
+    patient_id 为 None 时返回空上下文。
+    db 为 None 时自动创建 session。
+    """
+    if patient_id is None:
+        return PatientContext()
+
+    from src.infra.database import AsyncSessionLocal
+    _own_session = db is None
+    if _own_session:
+        db = AsyncSessionLocal()
+
+    try:
+        # 查患者基本信息
+        patient_result = await db.execute(
+            select(Patient).where(Patient.id == patient_id)
+        )
+        patient = patient_result.scalar_one_or_none()
+        if not patient:
+            logger.warning(f"患者 ID {patient_id} 不存在")
+            return PatientContext()
+
+        # 解析既往病史和过敏史（数据库中用逗号分隔存储）
+        medical_history = (
+            [h.strip() for h in patient.medical_history.split(",") if h.strip()]
+            if patient.medical_history else []
+        )
+        allergy_history = (
+            [a.strip() for a in patient.allergy_history.split(",") if a.strip()]
+            if patient.allergy_history else []
+        )
+
+        # 查近期问诊记录（取最近 N 条）
+        consultations_result = await db.execute(
+            select(Consultation)
+            .where(Consultation.patient_id == patient_id)
+            .order_by(desc(Consultation.created_at))
+            .limit(recent_consultations_limit)
+        )
+        consultations = consultations_result.scalars().all()
+
+        # 把历史诊断结论加入 medical_history（用于置信度加权）
+        for c in consultations:
+            if c.diagnosis and c.diagnosis not in medical_history:
+                medical_history.append(c.diagnosis)
+
+        return PatientContext(
+            patient_id=patient_id,
+            age=patient.age,
+            gender=patient.gender,
+            allergy_history=allergy_history,
+            medical_history=medical_history,
+        )
+    except Exception as e:
+        logger.error(f"加载患者上下文失败: {e}")
+        return PatientContext()
+    finally:
+        if _own_session:
+            await db.close()
+
+
+async def save_consultation_record(
+    patient_id: int | None,
+    session_id: str,
+    chief_complaint: str,
+    diagnosis: str,
+    department_name: str,
+    urgency_level: str,
+    db: AsyncSession | None = None,
+) -> int | None:
+    """
+    将本次问诊结果保存到 PostgreSQL consultations 表。
+    返回新记录的 ID，失败时返回 None。
+    db 为 None 时（如从 Supervisor 工具链调用）自动创建 session。
+    """
+    from src.infra.database import AsyncSessionLocal
+
+    # db 为 None 时自己创建 session，用完后关闭
+    _own_session = db is None
+    if _own_session:
+        db = AsyncSessionLocal()
+
+    try:
+        # 查科室 ID（通过科室名查）
+        from src.modules.medical.model import Department
+        dept_result = await db.execute(
+            select(Department).where(Department.name == department_name)
+        )
+        dept = dept_result.scalar_one_or_none()
+        dept_id = dept.id if dept else None
+
+        consultation = Consultation(
+            patient_id=patient_id,  # 未登录用户为 None，存 NULL
+            department_id=dept_id,
+            chief_complaint=chief_complaint,
+            diagnosis=diagnosis,
+            urgency_level=urgency_level,
+            session_id=session_id,
+        )
+        db.add(consultation)
+        await db.commit()
+        await db.refresh(consultation)
+        logger.info(f"问诊记录已保存，ID={consultation.id}")
+        return consultation.id
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"保存问诊记录失败: {e}")
+        return None
+    finally:
+        if _own_session:
+            await db.close()
+4. 关键设计说明
+- load_patient_context 把历史问诊的 diagnosis 字段也合并进 medical_history，这样置信度加权时能识别"患者曾被诊断为 XX 病"。
+- save_consultation_record 在问诊结束时调用，无论用户是否同意挂号都保存记录（状态由调用方控制）。
+- 未登录用户（patient_id=None）返回空上下文，流程正常运行，只是没有历史加权。
+
+
+Step 8：LangGraph 问诊状态机主体（workflow核心定义）
+1. 解决什么问题
+这是整个问诊 Agent 的"大脑"。把前面所有模块（症状标准化、Neo4j 查询、置信度计算、Prompt 模板、DB 查询）串联成一个完整的 LangGraph StateGraph，实现最多 10 轮的结构化问诊对话。
+2. 新建文件
+src/agents/inquiry/graph.py
+3. 完整代码（第一部分：节点函数）
+
+from __future__ import annotations
+import json
+from typing import Any
+
+from loguru import logger
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
+from pymilvus import MilvusClient
+
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.neo4j_client import get_neo4j_driver
+from src.core.config import get_settings
+from src.agents.inquiry.state import (
+    InquiryState, InquiryPhase, InquiryHandoffPayload, PatientContext
+)
+from src.agents.inquiry.symptom_normalizer import (
+    normalize_symptoms, humanize_symptoms
+)
+from src.agents.inquiry.neo4j_queries import (
+    query_candidate_diseases, enrich_candidate_details, get_pending_symptoms
+)
+from src.agents.inquiry.confidence import apply_context_weights, check_convergence
+from src.agents.inquiry.prompts import (
+    CLARIFY_PROMPT, ASK_SYMPTOMS_PROMPT, PARSE_ANSWER_PROMPT,
+    CONCLUSION_PROMPT, EMERGENCY_CHECK_PROMPT
+)
+
+settings = get_settings()
+
+# ── 依赖注入容器（在 graph 编译时注入，避免全局单例） ──────────────────────
+class InquiryDeps:
+    def __init__(self, llm, neo4j_driver, embedding_model, milvus_client, db_session):
+        self.llm = llm
+        self.neo4j_driver = neo4j_driver
+        self.embedding_model = embedding_model
+        self.milvus_client = milvus_client
+        self.db_session = db_session
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 节点函数（每个节点接收 state，返回 state 的部分更新）
+# ════════════════════════════════════════════════════════════════════════
+
+async def node_load_context(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点①：加载患者上下文。
+    从 PostgreSQL 加载既往病史，从 Milvus 加载长期记忆。
+    仅在第一轮（round==0）执行，后续轮次跳过。
+    """
+    if state.round > 0:
+        logger.debug("节点①加载患者上下文 非首轮，跳过上下文加载 (round={})", state.round)
+        return {}  # 非首轮，不重复加载
+
+    logger.info("节点①加载患者上下文 开始加载患者上下文 | patient_id={} session_id={}",
+                state.patient_context.patient_id, state.session_id)
+
+    from src.agents.inquiry.db_queries import load_patient_context
+    # user_id 即 patients.id，前端传来的是字符串，转 int 后查患者档案
+    patient_id = int(state.patient_context.patient_id) if state.patient_context.patient_id else None
+    # 从HIS查询患者信息和就诊记录
+    patient_ctx = await load_patient_context(
+        patient_id=patient_id,
+        db=deps.db_session,
+    )
+
+    ## TODO 从Milvus加载长期记忆
+
+
+    merged_ctx = PatientContext(
+        patient_id=state.patient_context.patient_id,  # 保持 str，贯穿整个流程
+        age=patient_ctx.age,
+        gender=patient_ctx.gender,
+        allergy_history=patient_ctx.allergy_history,
+        medical_history=patient_ctx.medical_history,
+        long_term_memories=state.patient_context.long_term_memories,
+    )
+    logger.info("节点①加载患者上下文 上下文加载完成 | age={} gender={} medical_history={} allergy={}",
+                merged_ctx.age, merged_ctx.gender,
+                len(merged_ctx.medical_history), len(merged_ctx.allergy_history))
+    return {"patient_context": merged_ctx}
+
+
+async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点②：急症识别。
+    仅在第一轮执行。识别到急症时直接跳转到 CONCLUDE 阶段，
+    并在 candidate_diseases 中放入一个特殊的"急诊"标记。
+    """
+    if state.round > 0:
+        logger.debug("节点②急症识别 非首轮，跳过急症检查")
+        return {}
+
+    logger.info("节点②急症识别 开始急症识别检查")
+    last_user_msg = ""
+    for msg in reversed(state.messages):  # 历史消息： 1-2-3-4-5-6
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg:
+        return {}
+
+    prompt = EMERGENCY_CHECK_PROMPT.format(user_input=last_user_msg)
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        result = json.loads(content)
+        if result.get("is_emergency"):
+            logger.warning("节点②急症识别 ⚠️ 检测到急症！原因: {}", result.get('reason', ''))
+            emergency_reply = (
+                "⚠️ 根据您描述的症状，这可能是紧急情况！\n\n"
+                f"原因：{result.get('reason', '存在急症风险')}\n\n"
+                "**请立即前往最近医院的急诊科就诊，或拨打 120 急救电话。**\n\n"
+                "不要等待，请立即行动！"
+            )
+            return {
+                "phase": InquiryPhase.END,
+                "messages": [AIMessage(content=emergency_reply)],
+            }
+        else:
+            logger.info("节点②急症识别 未检测到急症，继续正常问诊流程")
+    except Exception as e:
+        logger.warning(f"急症识别解析失败: {e}")
+    return {}
+
+
+async def node_extract_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点③：症状标准化。
+    从最新的用户消息中提取症状，经三层标准化后合并到 confirmed_symptoms。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg:
+        logger.warning("节点③症状标准化 未找到用户消息，跳过症状提取")
+        return {}
+
+    logger.info("节点③症状标准化 开始提取症状 | 用户输入: {!r}", last_user_msg[:80])
+
+    # 等待标准化三层管线执行
+    result = await normalize_symptoms(
+        user_input=last_user_msg,
+        llm=deps.llm,
+        neo4j_driver=deps.neo4j_driver,
+        embedding_model=deps.embedding_model,
+        milvus_client=deps.milvus_client,
+    )
+
+    new_confirmed = list(set(state.confirmed_symptoms) | set(result["all_standard"]))
+    new_unmatched = list(set(state.unmatched_symptoms) | set(result["unmatched"]))
+
+    logger.info("节点③症状标准化 提取完成 | 标准化症状={} 未匹配={} 累计确认={}",
+                result["all_standard"], result["unmatched"], new_confirmed)
+
+    if new_confirmed:
+        return {
+            "confirmed_symptoms": new_confirmed,
+            "unmatched_symptoms": new_unmatched,
+            "phase": InquiryPhase.GRAPH_QUERY, # 接下来进入哪个阶段
+        }
+    else:
+        logger.info("节点③症状标准化 无法提取明确症状，进入澄清流程")
+        return {
+            "unmatched_symptoms": new_unmatched,
+            "phase": InquiryPhase.CLARIFY,
+        }
+
+
+async def node_clarify(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点④：澄清模糊描述。
+    当用户描述没有明确症状时，引导用户进一步描述。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    logger.info("节点④澄清模糊描述 用户描述模糊，发起澄清引导 | round={}", state.round)
+    prompt = CLARIFY_PROMPT.format(user_input=last_user_msg)
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    logger.debug("节点④澄清模糊描述 澄清回复已生成，等待用户下一轮输入")
+    return {
+        "round": state.round + 1,
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_query_neo4j(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑤：查询 Neo4j 候选疾病。
+    用已确认症状查候选疾病，补充详情，应用上下文权重。
+    """
+    logger.info("节点⑤查询候选疾病 查询候选疾病 | 确认症状={}", state.confirmed_symptoms)
+    candidates = await query_candidate_diseases(
+        confirmed_symptoms=state.confirmed_symptoms,
+        neo4j_driver=deps.neo4j_driver,
+    )
+    if candidates:
+        candidates = await enrich_candidate_details(candidates, deps.neo4j_driver)
+        candidates = apply_context_weights(
+            candidates, state.patient_context, state.denied_symptoms
+        )
+        logger.info("节点⑤查询候选疾病 候选疾病 top5: {}",
+                    [(c.name, round(c.confidence, 3)) for c in candidates[:5]])
+    else:
+        logger.warning("节点⑤查询候选疾病 未找到候选疾病，将强制结束问诊")
+
+    # 收敛判断（要么超10轮，要么有候选疾病，要么没有更多有用信息）
+    should_conclude, force_conclude = check_convergence(candidates, state.round)
+    logger.info("节点⑤查询候选疾病 收敛判断 | should_conclude={} force_conclude={} round={}",
+                should_conclude, force_conclude, state.round)
+
+    if should_conclude:
+        return {
+            "candidate_diseases": candidates,
+            "phase": InquiryPhase.CONCLUDE,
+            "force_conclude": force_conclude,
+        }
+    elif not candidates:
+        # 没有候选疾病（症状太罕见），直接结束
+        return {
+            "candidate_diseases": [],
+            "phase": InquiryPhase.CONCLUDE,
+            "force_conclude": True,
+        }
+    else:
+        return {
+            "candidate_diseases": candidates,
+            "phase": InquiryPhase.SYMPTOM_CONFIRM,
+        }
+
+
+async def node_ask_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑥：生成追问话术。
+    从候选疾病中选出区分度最高的 ≤3 个症状，口语化后追问用户。
+    """
+    logger.info("节点⑥生成追问话术 生成追问 | round={} 已问症状={}", state.round, state.asked_symptoms)
+    pending = await get_pending_symptoms(
+        candidates=state.candidate_diseases,
+        confirmed_symptoms=state.confirmed_symptoms,
+        denied_symptoms=state.denied_symptoms,
+        asked_symptoms=state.asked_symptoms,
+    )
+
+    # 取区分度最高的前 3 个（出现次数最少的）
+    top_symptoms = [s for s, _ in pending[:3]]
+
+    if not top_symptoms:
+        # 没有更多可问的症状，直接收敛
+        logger.info("节点⑥生成追问话术 无更多可追问症状，直接进入结论")
+        return {"phase": InquiryPhase.CONCLUDE}
+
+    logger.info("节点⑥生成追问话术 本轮追问症状: {}", top_symptoms)
+    # 口语化
+    human_symptoms = await humanize_symptoms(top_symptoms, deps.llm)
+
+    prompt = ASK_SYMPTOMS_PROMPT.format(
+        symptoms_to_ask="\n".join(f"- {s}" for s in human_symptoms)
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    return {
+        "round": state.round + 1,
+        "asked_symptoms": state.asked_symptoms + top_symptoms,
+        "pending_ask_symptoms": top_symptoms,  # 记录本轮问了哪些，供下一节点解析
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_parse_answer(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑦：解析用户对追问的回答。
+    判断用户确认/否认了哪些症状，更新 confirmed_symptoms 和 denied_symptoms。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg or not state.pending_ask_symptoms:
+        logger.debug("节点⑦解析用户回答 无用户消息或无待解析症状，跳过")
+        return {}
+
+    logger.info("节点⑦解析用户回答 解析用户回答 | 待解析症状={} 用户回答={!r}",
+                state.pending_ask_symptoms, last_user_msg[:80])
+
+    prompt = PARSE_ANSWER_PROMPT.format(
+        asked_symptoms=", ".join(state.pending_ask_symptoms),
+        user_answer=last_user_msg,
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        parsed = json.loads(content)
+        new_confirmed = list(
+            set(state.confirmed_symptoms) | set(parsed.get("confirmed", []))
+        )
+        new_denied = list(
+            set(state.denied_symptoms) | set(parsed.get("denied", []))
+        )
+        logger.info("节点⑦解析用户回答 解析结果 | 新增确认={} 新增否认={}",
+                    parsed.get("confirmed", []), parsed.get("denied", []))
+    except Exception as e:
+        logger.warning(f"解析用户回答失败: {e}")
+        new_confirmed = state.confirmed_symptoms
+        new_denied = state.denied_symptoms
+
+    return {
+        "confirmed_symptoms": new_confirmed,
+        "denied_symptoms": new_denied,
+        "pending_ask_symptoms": [],
+    }
+
+
+async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑧：生成诊断结论。
+    整合所有信息，生成用户可读的结论文案，并构建 HandoffPayload。
+    """
+    candidates = state.candidate_diseases
+    if not candidates:
+        logger.warning("节点⑧生成诊断结论 无候选疾病，返回无结果提示")
+        no_result_msg = (
+            "根据您描述的症状，我暂时无法在知识库中找到匹配的疾病。\n\n"
+            "这可能是因为症状较为罕见，或者需要更多信息。\n"
+            "建议您直接前往医院就诊，由医生进行面诊。"
+        )
+        return {
+            "phase": InquiryPhase.END,
+            "messages": [AIMessage(content=no_result_msg)],
+        }
+
+    top1 = candidates[0]
+    suspected = [c.name for c in candidates[1:5]]
+    logger.info("节点⑧生成诊断结论 生成诊断结论 | 主诊断={} 置信度={:.3f} 科室={} 疑似={}",
+                top1.name, top1.confidence, top1.department, suspected)
+
+    prompt = CONCLUSION_PROMPT.format(
+        confirmed_symptoms="、".join(state.confirmed_symptoms) or "暂无",
+        primary_disease=top1.name,
+        confidence=top1.confidence,
+        suspected_diseases="、".join(suspected) if suspected else "无",
+        department=top1.department or "综合内科",
+        checks="、".join(top1.checks[:5]) if top1.checks else "暂无",
+        force_conclude=state.force_conclude,
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    # 构建移交数据包（挂号数据包）
+    handoff = InquiryHandoffPayload(
+        patient_id=state.patient_context.patient_id,
+        patient_context=state.patient_context.model_dump(),
+        confirmed_symptoms=state.confirmed_symptoms,
+        denied_symptoms=state.denied_symptoms,
+        unmatched_symptoms=state.unmatched_symptoms,
+        primary_disease=top1.name,
+        primary_confidence=top1.confidence,
+        suspected_diseases=suspected,
+        department=top1.department or "综合内科",
+        recommended_checks=top1.checks[:5],
+        total_rounds=state.round,
+        session_id=state.session_id,
+    )
+
+    return {
+        "phase": InquiryPhase.HANDOFF,
+        "handoff_payload": handoff,
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_save_record(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑨：保存问诊记录到 PostgreSQL。
+    无论用户是否同意挂号都执行。
+    """
+    if not state.handoff_payload:
+        logger.warning("节点⑨保存问诊记录 无 handoff_payload，跳过保存")
+        return {"phase": InquiryPhase.END}
+
+    from src.agents.inquiry.db_queries import save_consultation_record
+    payload = state.handoff_payload
+    chief_complaint = "、".join(state.confirmed_symptoms[:5])
+    # user_id 即 patients.id，转 int 后写入外键
+    patient_id = int(payload.patient_id) if payload.patient_id else None
+
+    logger.info("节点⑨保存问诊记录 保存问诊记录 | patient_id={} diagnosis={} department={}",
+                patient_id, payload.primary_disease, payload.department)
+
+    await save_consultation_record(
+        patient_id=patient_id,
+        session_id=payload.session_id,
+        chief_complaint=chief_complaint,
+        diagnosis=payload.primary_disease,
+        department_name=payload.department,
+        urgency_level="normal",
+        db=deps.db_session,
+    )
+    logger.info("节点⑨保存问诊记录 问诊记录保存完成，流程结束")
+    return {"phase": InquiryPhase.END}
+
+4. 完整代码（第二部分：图的组装与路由）
+# src/agents/inquiry/graph.py （续）
+
+# ════════════════════════════════════════════════════════════════════════
+# 路由函数（决定下一个节点）
+# ════════════════════════════════════════════════════════════════════════
+
+def route_dispatcher(state: InquiryState) -> str:
+    """入口分发：首轮走完整流程，后续轮次根据上一轮状态决定入口。"""
+    if state.round == 0:
+        return "load_context"
+    # 上一轮是追问症状（pending_ask_symptoms 非空）→ 解析用户回答
+    if state.pending_ask_symptoms:
+        return "parse_answer"
+    # 上一轮是澄清引导（pending_ask_symptoms 为空）→ 提取新症状
+    return "extract_symptoms"
+
+
+def route_after_emergency(state: InquiryState) -> str:
+    """急症检查后的路由：急症直接结束，否则提取症状。"""
+    if state.phase == InquiryPhase.END:
+        return END
+    return "extract_symptoms"
+
+
+def route_after_extract(state: InquiryState) -> str:
+    """症状提取后的路由：有症状查图谱，没症状澄清。"""
+    if state.phase == InquiryPhase.GRAPH_QUERY:
+        return "query_neo4j"
+    return "clarify"
+
+
+def route_after_neo4j(state: InquiryState) -> str:
+    """Neo4j 查询后的路由：收敛则结论，否则追问。"""
+    if state.phase == InquiryPhase.CONCLUDE:
+        return "conclude"
+    return "ask_symptoms"
+
+
+def route_after_ask(state: InquiryState) -> str:
+    """追问后的路由：没有更多症状可问则直接结论。"""
+    if state.phase == InquiryPhase.CONCLUDE:
+        return "conclude"
+    return END  # 等待用户回答（下一轮消息进来后从 parse_answer 继续）
+
+
+def route_after_parse(state: InquiryState) -> str:
+    """解析回答后：重新查 Neo4j 更新候选疾病。"""
+    return "query_neo4j"
+
+
+def route_after_conclude(state: InquiryState) -> str:
+    """结论后：保存记录，结束。"""
+    if state.phase == InquiryPhase.END:
+        return END
+    return "save_record"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 图的组装
+# ════════════════════════════════════════════════════════════════════════
+
+def build_inquiry_graph(deps: InquiryDeps):
+    """
+    构建并编译问诊 StateGraph。
+    deps 通过闭包注入到每个节点函数中。
+    """
+    # 用闭包把 deps 绑定到节点函数
+    async def _load_context(state):    return await node_load_context(state, deps)
+    async def _check_emergency(state): return await node_check_emergency(state, deps)
+    async def _extract_symptoms(state):return await node_extract_symptoms(state, deps)
+    async def _clarify(state):         return await node_clarify(state, deps)
+    async def _query_neo4j(state):     return await node_query_neo4j(state, deps)
+    async def _ask_symptoms(state):    return await node_ask_symptoms(state, deps)
+    async def _parse_answer(state):    return await node_parse_answer(state, deps)
+    async def _conclude(state):        return await node_conclude(state, deps)
+    async def _save_record(state):     return await node_save_record(state, deps)
+
+    graph = StateGraph(InquiryState)
+
+    # 注册节点（dispatcher 是无操作的分发节点，仅用于路由）
+    graph.add_node("dispatcher",       lambda state: {})
+    graph.add_node("load_context",     _load_context)
+    graph.add_node("check_emergency",  _check_emergency)
+    graph.add_node("extract_symptoms", _extract_symptoms)
+    graph.add_node("clarify",          _clarify)
+    graph.add_node("query_neo4j",      _query_neo4j)
+    graph.add_node("ask_symptoms",     _ask_symptoms)
+    graph.add_node("parse_answer",     _parse_answer)
+    graph.add_node("conclude",         _conclude)
+    graph.add_node("save_record",      _save_record)
+
+    # 入口：dispatcher 根据 round 分发到首轮流程或后续轮次流程
+    graph.set_entry_point("dispatcher")
+
+    # 注册边（固定边）
+    graph.add_edge("load_context", "check_emergency")
+    graph.add_edge("clarify", END)          # 澄清后等待用户回复
+    graph.add_edge("save_record", END)
+
+    # 注册条件边（路由）
+    graph.add_conditional_edges("dispatcher",       route_dispatcher,
+                                 {"load_context": "load_context", "parse_answer": "parse_answer",
+                                  "extract_symptoms": "extract_symptoms"})
+    graph.add_conditional_edges("check_emergency",  route_after_emergency,
+                                 {"extract_symptoms": "extract_symptoms", END: END})
+    graph.add_conditional_edges("extract_symptoms", route_after_extract,
+                                 {"query_neo4j": "query_neo4j", "clarify": "clarify"})
+    graph.add_conditional_edges("query_neo4j",      route_after_neo4j,
+                                 {"conclude": "conclude", "ask_symptoms": "ask_symptoms"})
+    graph.add_conditional_edges("ask_symptoms",     route_after_ask,
+                                 {"conclude": "conclude", END: END})
+    graph.add_conditional_edges("parse_answer",     route_after_parse,
+                                 {"query_neo4j": "query_neo4j"})
+    graph.add_conditional_edges("conclude",         route_after_conclude,
+                                 {"save_record": "save_record", END: END})
+    return graph.compile()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 对外接口：供 call_inquiry_agent 工具调用
+# ════════════════════════════════════════════════════════════════════════
+
+async def run_inquiry(
+    user_message: str,
+    thread_id: str,
+    deps: InquiryDeps,
+    existing_state: InquiryState | None = None,
+    user_id: str | None = None,
+    long_term_memories: list[str] | None = None,
+) -> tuple[str, InquiryState]:
+    """
+    执行一轮问诊对话。
+
+    Args:
+        user_message      : 用户本轮输入
+        thread_id        : thread_id（用于关联 Redis 和 PostgreSQL 记录）
+        deps              : 依赖注入容器
+        existing_state    : 上一轮的状态（多轮对话时传入）
+        user_id           : 来自 UserContext 的用户 ID，贯穿整个问诊流程
+        long_term_memories: Supervisor 从 Milvus 检索到的长期记忆摘要
+
+    Returns:
+        (assistant_reply, new_state)
+    """
+    graph = build_inquiry_graph(deps)
+
+    if existing_state is None:
+        # 首轮：初始化状态
+        state = InquiryState(
+            session_id=thread_id,
+            patient_context=PatientContext(
+                patient_id=user_id,
+                long_term_memories=long_term_memories or [],
+            ),
+        )
+    else:
+        state = existing_state
+
+    # 追加用户消息
+    state.messages.append(HumanMessage(content=user_message))
+
+    logger.info("▶ run_inquiry 开始 | session={} round={} entry={} user_id={}",
+                thread_id, state.round,
+                "load_context" if state.round == 0 else "parse_answer", user_id)
+
+    # 执行图（dispatcher 节点会根据 round 自动路由到正确的入口）
+    config = {"configurable": {"thread_id": thread_id}}
+    result = await graph.ainvoke(state, config=config)
+
+    new_state = InquiryState(**result) if isinstance(result, dict) else result
+
+    # 取最后一条 AI 消息作为回复
+    reply = ""
+    for msg in reversed(new_state.messages):
+        if isinstance(msg, AIMessage):
+            reply = msg.content
+            break
+
+    logger.info("◀ run_inquiry 完成 | session={} phase={} round={} reply_len={}",
+                thread_id, new_state.phase, new_state.round, len(reply))
+    return reply, new_state
+def build_inquiry_deps(db_session=None) -> InquiryDeps:
+    """
+    构建问诊依赖注入容器的工厂函数。
+    供 call_inquiry_agent 工具和 FastAPI 路由共用，避免重复代码。
+    """
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    neo4j_driver = get_neo4j_driver()
+    get_milvus_client_alias()  # 确保连接已建立
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    return InquiryDeps(
+        llm=llm,
+        neo4j_driver=neo4j_driver,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        db_session=db_session,
+    )
+5. 关键设计说明
+- 闭包注入依赖：LangGraph 节点函数签名只接受 state，通过闭包把 deps（llm、neo4j_driver 等）绑定进去，避免使用全局变量。
+- 多轮对话的入口切换：首轮从 load_context 开始；后续轮次从 parse_answer 开始（因为用户是在回答上一轮的追问）。
+- clarify 和 ask_symptoms 后接 END：这两个节点输出 AI 消息后等待用户回复，下一轮消息进来时再继续。这是 LangGraph 实现"暂停等待用户输入"的标准模式。
+- node_check_emergency 只在第一轮执行：通过 if state.round > 0: return {} 跳过，避免每轮都调用 LLM 做急症判断。
+6. InquiryGraph 节点架构图
+下图完整呈现 build_inquiry_graph 中注册的全部节点、固定边、条件边，以及每条边对应的路由函数和触发条件。
+[图片]
+
+
+7. 未来优化方向
+- 用 LangGraph 的 interrupt_before / interrupt_after 机制替代手动 END，更优雅地实现"暂停等待用户输入"。
+- build_inquiry_graph 每次调用都重新编译图，可以改为模块级缓存（@lru_cache），提升性能。
+- 加入 LangGraph 的 checkpointer（Redis），让问诊状态持久化，用户关闭页面后再回来可以继续上次的问诊。
+
+
+
+Step 9：改造 Inquiry Worker Agent（LLM 生成模拟挂号数据）
+1. 解决什么问题
+现有的 inquiry_agent.py 是一个空壳（tools=[]，纯 LLM 推理）。改造后它的职责变为：接收 多轮对话后传来的 InquiryHandoffPayload，执行预约挂号逻辑（生成问诊单、调用挂号系统）。同时，call_inquiry_agent 工具也需要改造，让它能启动 InquiryGraph 进行多轮问诊，而不只是单次调用。
+2. 修改文件
+src/agents/workers/inquiry_agent.py   （改造）
+3. 完整代码
+from langchain.agents import create_agent
+from langchain_deepseek import ChatDeepSeek
+
+from src.core.config import get_settings
+from src.agents.inquiry.state import InquiryHandoffPayload
+
+settings = get_settings()
+
+INQUIRY_WORKER_PROMPT = """你是天宫医疗的挂号助手。
+
+你已经收到了智能问诊的结论，现在需要帮助患者完成挂号预约。
+
+问诊结论：
+{handoff_payload}
+
+你的职责：
+1. 向患者确认挂号信息（科室、时间偏好）
+2. 生成问诊单摘要（供医生参考）
+3. 完成预约挂号（调用挂号工具，待接入）
+
+请用温和、专业的语气与患者沟通。"""
+
+
+def get_llm():
+    return ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+
+
+def create_inquiry_worker_agent():
+    llm = get_llm()
+    # 当前阶段：无工具，纯 LLM 推理
+    # 未来可添加：预约挂号工具、问诊单生成工具、排班查询工具
+    tools = []
+    return create_agent(model=llm, tools=tools)
+
+
+_inquiry_worker_agent = None
+
+def get_inquiry_worker_agent():
+    global _inquiry_worker_agent
+    if _inquiry_worker_agent is None:
+        _inquiry_worker_agent = create_inquiry_worker_agent()
+    return _inquiry_worker_agent
+
+
+async def handle_handoff(payload: InquiryHandoffPayload) -> str:
+    """
+    接收问诊移交数据包，执行挂号流程。
+    返回给用户的挂号确认消息。
+    """
+    agent = get_inquiry_worker_agent()
+    prompt = INQUIRY_WORKER_PROMPT.format(
+        handoff_payload=payload.model_dump_json(indent=2, ensure_ascii=False)
+    )
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": prompt}]}
+    )
+    return result["messages"][-1].content
+4. 关键设计说明
+- handle_handoff 接收结构化的 InquiryHandoffPayload，把它序列化为 JSON 注入 Prompt，让 Worker Agent 有完整的上下文。
+- tools = [] 是当前阶段的占位，未来接入挂号系统时在这里添加工具。
+
+5. LLM 生成模拟挂号数据
+文件末尾追加如下代码； 
+注销生产环境用的 handle_handoff 函数
+
+# ── 结构化输出 Schema ─────────────────────────────────────────────────────
+
+class AppointmentResult(BaseModel):
+    """LLM 生成的模拟挂号预约结果"""
+    doctor_name: str = Field(description="医生姓名及职称，如：张伟（主任医师）")
+    department: str = Field(description="就诊科室")
+    date: str = Field(description="就诊日期，格式 YYYY-MM-DD，取明天或后天")
+    time_slot: str = Field(description="就诊时段，如：08:00-12:00 或 14:00-17:30")
+    fee: float = Field(description="挂号费（元），主任医师 50 元，其他 30 元")
+    queue_number: int = Field(description="就诊序号，1~30 之间的整数")
+
+
+# ── 核心函数 ──────────────────────────────────────────────────────────────
+
+async def mock_create_appointment(payload: InquiryHandoffPayload) -> AppointmentResult:
+    """
+    用 LLM 结构化输出生成一条模拟预约数据。
+    输入问诊结论，输出符合场景的预约信息，无需维护任何模拟数据库。
+    """
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.7,  # 适当随机，让每次生成的医生/时间略有不同
+    )
+    structured_llm = llm.with_structured_output(AppointmentResult)
+
+    prompt = f"""根据以下问诊结论，生成一条合理的挂号预约信息。
+
+问诊结论：
+- 主诊断：{payload.primary_disease}
+- 建议科室：{payload.department}
+- 确认症状：{', '.join(payload.confirmed_symptoms[:5])}
+
+要求：
+- 医生姓名用中文常见姓名，附上职称
+- 日期取明天或后天（今天是 {__import__('datetime').date.today()}）
+- 时段选上午或下午
+- 挂号费主任医师 50 元，其他 30 元"""
+
+    return await structured_llm.ainvoke(prompt)
+
+# 测试环境用，不依赖真实挂号系统
+async def handle_handoff(payload: InquiryHandoffPayload) -> str:
+    """
+    接收问诊移交数据包，生成模拟挂号结果并返回确认文案。
+    """
+    result = await mock_create_appointment(payload)
+    appointment_id = f"APT{uuid.uuid4().hex[:8].upper()}"
+
+    return (
+        f"已为您成功预约挂号！\n\n"
+        f"预约号：{appointment_id}\n"
+        f"就诊科室：{result.department}\n"
+        f"就诊医生：{result.doctor_name}\n"
+        f"就诊时间：{result.date} {result.time_slot}\n"
+        f"就诊序号：第 {result.queue_number} 号\n"
+        f"挂号费：{result.fee} 元\n\n"
+        f"请提前 15 分钟到诊室门口等候，祝您早日康复。"
+    )
+
+
+
+Step 10：改造 call_inquiry_agent 工具
+1. 解决什么问题
+call_inquiry_agent 工具只负责首轮启动问诊：
+1. 初始化 InquiryState
+2. 执行第一轮 InquiryGraph
+3. 在 Redis 写入 inquiry_active 标记。
+4. 后续多轮对话由路由层直接调用 InquiryGraph，不再经过这个工具。这样工具的职责变得单一清晰。
+
+2. 修改文件
+src/agents/tools/worker_tools.py   （修改 call_inquiry_agent）
+3. 修改内容
+在 worker_tools.py 顶部新增导入，并替换 call_inquiry_agent 函数：
+# src/agents/worker_tools.py
+
+from langchain_core.tools import tool
+from src.agents.workers.report_agent import get_report_agent
+from src.agents.workers.drug_agent import get_drug_agent
+from src.agents.workers.knowledge_agent import get_knowledge_agent
+from src.agents.workers.operation_agent import get_operation_agent
+
+
+from dataclasses import dataclass
+
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+
+from src.agents.workers.report_agent import get_report_agent
+from src.agents.workers.drug_agent import get_drug_agent
+from src.agents.workers.knowledge_agent import get_knowledge_agent
+from src.agents.workers.operation_agent import get_operation_agent
+
+from src.agents.inquiry.graph import run_inquiry, InquiryDeps, build_inquiry_deps
+from src.agents.inquiry.state import InquiryPhase
+from src.agents.workers.inquiry_agent import handle_handoff
+from src.infra.redis_cache import get_checkpointer_redis
+from src.core.config import get_settings
+
+settings = get_settings()
+
+@dataclass
+class UserContext:  # 用户上下文
+    user_id: str
+    session_id: str
+
+# 仅第一轮会发起调用
+@tool
+async def call_inquiry_agent(message: str, runtime: ToolRuntime[UserContext]) -> str:
+    """
+    启动智慧问诊流程。
+    适用场景：患者首次描述症状、询问挂哪个科室时。
+    后续多轮对话由系统自动路由，无需再次调用此工具。
+
+    Args:
+        message    : 患者描述的症状或问诊需求
+    """
+    # 获取当前会话 ID 和用户 ID
+    session_id = runtime.context.session_id
+    user_id = runtime.context.user_id
+    print("🔧工具调用 call_inquiry_agent :", session_id, message)
+
+    deps = build_inquiry_deps()
+
+    # 首轮：初始化空状态，执行第一轮问诊; 调用工作流
+    reply, new_state = await run_inquiry(
+        user_message=message,
+        thread_id=f"{user_id}:{session_id}",
+        deps=deps,
+        existing_state=None,  # 首轮，无历史状态
+        user_id=user_id,
+    )
+
+    # 首轮即收敛（精确症状/急症等）：触发挂号移交，不设活跃标记
+    if new_state.phase == InquiryPhase.END:
+        if new_state.handoff_payload:
+            handoff_reply = await handle_handoff(new_state.handoff_payload)
+            return f"{reply}\n\n---\n{handoff_reply}"
+        return reply
+
+    # 问诊未结束：保存状态，设置活跃标记，等待后续轮次
+    redis = get_checkpointer_redis()
+    state_key = f"inquiry_state:{user_id}:{session_id}"
+    await redis.set(
+        state_key,
+        new_state.model_dump_json(),
+        ex=3600,  # 1 小时过期
+    )
+
+    active_key = f"inquiry_active:{user_id}:{session_id}"
+    await redis.set(active_key, "1", ex=3600)
+
+    return reply
+
+
+@tool
+async def call_report_agent(message: str) -> str:
+    """
+    调用报告解读Agent，解读患者的检验报告或影像报告。
+    适用场景：患者上传了报告需要解读、询问报告中某项指标含义时。
+    message: 报告内容描述或患者的具体问题。
+    """
+    agent = get_report_agent()
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]}
+    )
+    return result["messages"][-1].content
+
+
+@tool
+async def call_drug_agent(message: str) -> str:
+    """
+    调用药物Agent，进行药物推荐、药物交互检测或处方审查。
+    适用场景：询问用什么药、多种药物能否同服、处方是否安全时。
+    message: 患者的用药问题或处方信息。
+    """
+    agent = get_drug_agent()
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]}
+    )
+    return result["messages"][-1].content
+
+
+@tool
+async def call_knowledge_agent(message: str) -> str:
+    """
+    调用知识问答Agent，回答医学知识类问题。
+    适用场景：询问疾病知识、治疗方案、医学术语解释、文献检索时。
+    message: 患者或医生的医学知识问题。
+    """
+    agent = get_knowledge_agent()
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]}
+    )
+    return result["messages"][-1].content
+
+
+@tool
+async def call_operation_agent(message: str) -> str:
+    """
+    调用运营数据Agent，查询医院运营统计数据。
+    适用场景：运营人员询问就诊量、收入、科室排名等运营数据时。
+    message: 运营人员的数据查询需求（自然语言）。
+    """
+    agent = get_operation_agent()
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]}
+    )
+    return result["messages"][-1].content
+
+
+# 所有 Worker 工具列表，供 Supervisor 使用
+WORKER_TOOLS = [
+    call_inquiry_agent,
+    call_report_agent,
+    call_drug_agent,
+    call_knowledge_agent,
+    call_operation_agent,
+]
+4. 关键设计说明
+- 工具只处理首轮，职责单一：初始化 → 执行第一轮 → 写 Redis 标记。
+- inquiry_active:{session_id} 是路由层的分流依据，键存在 = 问诊进行中。
+- inquiry_state:{session_id} 存储序列化的 InquiryState，后续轮次从 Redis 反序列化恢复。
+- TTL 设为 1 小时，超时自动清除，避免用户长时间不操作导致状态残留。
+5. 未来优化方向
+- build_inquiry_deps 中的 db_session 目前为 None，需要接入 FastAPI 的 AsyncSession 依赖注入。
+- TTL 可以在每次用户有新消息时重置，实现"活跃自动续期"。
+
+Step 11：FastAPI 路由（路由层分流 + 流式支持）
+1. 解决什么问题
+核心实现。路由层在收到每条用户消息时，先查 Redis 判断是否有活跃问诊会话：
+通过Redis中的两个状态（inquiry_active状态标记、inquiry_state数据共享）
+- 有：直接调用 InquiryGraph，完全绕过 Supervisor，保证多轮问诊状态连续
+- 无：走 Supervisor，由 LLM 判断意图
+同时支持流式（SSE）和非流式两种响应模式。
+2. 新建文件
+src/api/__init__.py          （空文件）
+src/api/routers/__init__.py  （空文件）
+src/api/routers/chat.py
+还需要在 src/agents/inquiry/graph.py 中补充 build_inquiry_deps 工厂函数（Step 10 的工具和 Step 11 的路由都需要用到）：
+# src/agents/inquiry/graph.py 末尾追加
+
+def build_inquiry_deps(db_session=None) -> InquiryDeps:
+    """
+    构建问诊依赖注入容器的工厂函数。
+    供 call_inquiry_agent 工具和 FastAPI 路由共用，避免重复代码。
+    """
+    llm = ChatDeepSeek(
+        model=settings.CHAT_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+    embedding_model = DashScopeEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
+    neo4j_driver = get_neo4j_driver()
+    get_milvus_client_alias()  # 确保连接已建立
+    milvus_client = MilvusClient(
+        uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+    )
+    return InquiryDeps(
+        llm=llm,
+        neo4j_driver=neo4j_driver,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        db_session=db_session,
+    )
+3. 完整代码
+# src/api/routers/chat.py
+
+from __future__ import annotations
+import json
+import traceback
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from loguru import logger
+
+from src.infra.database import get_db
+from src.infra.redis_cache import get_checkpointer_redis
+from src.agents.supervisor_agent import get_supervisor_agent, UserContext
+from src.agents.inquiry.graph import run_inquiry, build_inquiry_deps
+from src.agents.inquiry.state import InquiryState, InquiryPhase
+from src.agents.workers.inquiry_agent import handle_handoff
+
+router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    session_id: str
+    message: str
+    patient_id: int | None = None
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: str
+
+
+def _make_keys(user_id: str, session_id: str) -> tuple[str, str]:
+    """生成 Redis 键名。thread_id 与 Supervisor checkpointer 保持一致。"""
+    thread_id = f"{user_id}:{session_id}"
+    return f"inquiry_active:{thread_id}", f"inquiry_state:{thread_id}"
+
+
+async def _run_inquiry_turn(
+    message: str,
+    thread_id: str,
+    redis,
+    db,
+) -> str:
+    """
+    执行一轮问诊对话（路由层直接调用，绕过 Supervisor）。
+    从 Redis 恢复状态 → 执行 InquiryGraph → 保存新状态 → 返回回复。
+    """
+    active_key = f"inquiry_active:{thread_id}"
+    state_key  = f"inquiry_state:{thread_id}"
+
+    # 从 Redis 反序列化恢复上一轮状态
+    raw = await redis.get(state_key)
+    existing_state = InquiryState.model_validate_json(raw) if raw else None
+
+    deps = build_inquiry_deps(db_session=db)
+    reply, new_state = await run_inquiry(
+        user_message=message,
+        session_id=thread_id,
+        deps=deps,
+        existing_state=existing_state,
+    )
+
+    # 问诊结束：清除 Redis 标记，触发挂号移交
+    if new_state.phase in (InquiryPhase.HANDOFF, InquiryPhase.END):
+        await redis.delete(active_key, state_key)
+        if new_state.phase == InquiryPhase.HANDOFF and new_state.handoff_payload:
+            handoff_reply = await handle_handoff(new_state.handoff_payload)
+            return f"{reply}\n\n---\n{handoff_reply}"
+        return reply
+
+    # 问诊继续：更新 Redis 状态，重置 TTL
+    await redis.set(state_key,  new_state.model_dump_json(), ex=3600)
+    await redis.set(active_key, "1",                         ex=3600)
+    return reply
+
+
+# ── 非流式接口 ────────────────────────────────────────────────────────────
+@router.post("", response_model=ChatResponse)
+async def chat(
+    req: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    非流式对话接口。
+    路由层判断是否有活跃问诊：有则直接走 InquiryGraph，无则走 Supervisor。
+    """
+    try:
+        redis = get_checkpointer_redis()
+        active_key, state_key = _make_keys(req.user_id, req.session_id)
+        thread_id = f"{req.user_id}:{req.session_id}"
+        active_key = f"inquiry_active:{thread_id}"
+
+        # ── 问诊进行中：直接走 InquiryGraph ──
+        if await redis.exists(active_key):
+            reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
+            return ChatResponse(reply=reply, session_id=req.session_id)
+
+        # ── 无活跃问诊：走 Supervisor ──
+        agent = await get_supervisor_agent()
+        config = {"configurable": {"thread_id": thread_id}}
+
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": req.message}]},
+            config=config,
+            context=UserContext(user_id=req.user_id, session_id=req.session_id),
+        )
+        reply = result["messages"][-1].content
+        return ChatResponse(reply=reply, session_id=req.session_id)
+
+    except Exception as e:
+        logger.exception(f"chat 接口异常")
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+# ── 流式接口（SSE） ───────────────────────────────────────────────────────
+@router.post("/stream")
+async def chat_stream(
+    req: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    流式对话接口（Server-Sent Events）。
+    问诊进行中时，InquiryGraph 的回复以流式推送；
+    Supervisor 回复同样以流式推送。
+
+    客户端接收格式：
+        data: {"type": "token",  "content": "..."}
+        data: {"type": "done",   "session_id": "..."}
+        data: {"type": "error",  "message": "..."}
+    """
+    async def event_generator():
+        try:
+            redis = get_checkpointer_redis()
+            thread_id = f"{req.user_id}:{req.session_id}"
+            active_key = f"inquiry_active:{thread_id}"
+
+            # ── 问诊进行中：InquiryGraph 非流式执行，结果整体推送 ──
+            # （InquiryGraph 内部多次调用 LLM，流式拆分复杂度高，
+            #   此处以整体推送为主，后续可按节点拆分优化）
+            if await redis.exists(active_key):
+                reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
+                data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+
+            else:
+                # ── 无活跃问诊：Supervisor 流式推送 ──
+                agent = await get_supervisor_agent()
+                config = {"configurable": {"thread_id": thread_id}}
+                async for chunk in agent.astream(
+                    {"messages": [{"role": "user", "content": req.message}]},
+                    config=config,
+                    stream_mode="messages",
+                ):
+                    if isinstance(chunk, tuple):
+                        msg_chunk, _ = chunk
+                        if hasattr(msg_chunk, "content") and msg_chunk.content:
+                            data = json.dumps(
+                                {"type": "token", "content": msg_chunk.content},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {data}\n\n"
+
+            done_data = json.dumps(
+                {"type": "done", "session_id": req.session_id}, ensure_ascii=False
+            )
+            yield f"data: {done_data}\n\n"
+
+        except Exception as e:
+            logger.exception(f"chat/stream 接口异常")
+            error_data = json.dumps({"type": "error", "message": traceback.format_exc()}, ensure_ascii=False)
+            yield f"data: {error_data}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+4. 注册路由到 main.py
+# src/main.py，在 create_app() 函数中添加：
+from src.api.routers.chat import router as chat_router
+app.include_router(chat_router)
+5. 关键设计说明
+- 分流逻辑是确定性的：redis.exists(active_key) 返回 0 或 1，不依赖 LLM，不会出现路由错误。
+- 状态存 Redis 而非内存：InquiryState 序列化为 JSON 存入 Redis，支持多实例部署，服务重启后用户可以继续上次的问诊。
+- TTL 每轮重置：每次用户有新消息，ex=3600 会重置过期时间，实现"活跃续期"。
+- 流式接口的折中：问诊进行中时，InquiryGraph 内部会多次调用 LLM（提取症状、追问、解析回答），真正的逐 token 流式需要在每个节点内部单独处理，复杂度较高。当前实现是整体执行完再推送，体验上略有延迟，但逻辑简单可靠。
+- _run_inquiry_turn 复用：非流式和流式接口共用同一个函数处理问诊轮次，避免重复代码。
+6. 未来优化方向
+- InquiryGraph 的流式推送：在 node_ask_symptoms、node_conclude 等节点内部使用 llm.astream() 并通过 asyncio.Queue 向外传递 token，实现真正的逐字流式。
+- 加入 JWT 鉴权中间件，从 Token 中自动提取 user_id，不需要客户端手动传。
+
+
+
+改造：Supervisor 路由提示词&完整流程
+提示词不好。Supervisor 就可能不会调用子 Agent
+from dataclasses import dataclass
+
+from langchain.agents.middleware import SummarizationMiddleware
+from langgraph.checkpoint.redis import AsyncRedisSaver
+from langchain.agents import create_agent
+
+from src.agents.tools.store_tools import save_memory, search_memory
+from src.agents.tools.worker_tools import WORKER_TOOLS, UserContext
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.milvus_store import MilvusStore
+from src.infra.redis_cache import get_checkpointer_redis
+from dotenv import load_dotenv
+load_dotenv()
+
+
+def _get_embedding_model():
+    """返回向量化模型。根据你的实际情况替换。"""
+    # 使用 DashScope（阿里云）: 环境变量需要配置 DASHSCOPE_API_KEY
+    from langchain_community.embeddings import DashScopeEmbeddings
+    return DashScopeEmbeddings(model="text-embedding-v3")
+
+
+SUPERVISOR_SYSTEM_PROMPT = """你是天宫医疗的智能总助手。
+
+## 你的职责
+
+识别用户意图，调用对应的专项助手处理，整合结果后给出清晰、友好的回复。
+你自己不直接回答任何健康、医疗、症状相关的问题，必须通过专项助手完成。
+
+## 可调用的专项助手
+
+- call_inquiry_agent：智慧问诊
+  适用：用户描述身体不适、症状，需要分诊建议或预约挂号时
+  示例："我头疼发烧"、"肚子疼好几天了"、"不知道该挂什么科"、"有点不舒服"
+
+- call_report_agent：报告解读
+  适用：用户上传或描述检验报告、影像报告，需要解读关键指标时
+  示例："帮我看看这个血常规报告"、"我的CT结果是什么意思"
+
+- call_drug_agent：药物咨询
+  适用：询问用药建议、药物相互作用、处方安全性时
+  示例："布洛芬和阿莫西林能一起吃吗"、"我对青霉素过敏能用什么替代"
+
+- call_knowledge_agent：医学知识问答
+  适用：询问疾病知识、治疗方案、医学术语解释时
+  示例："高血压平时要注意什么"、"糖尿病的早期症状有哪些"
+
+- call_operation_agent：运营数据查询（仅限内部运营人员）
+  适用：查询医院就诊量、科室排名、收入统计等运营数据时
+
+## 记忆工具
+
+- search_memory：在调用专项助手前，先检索用户的历史记忆（过敏史、既往病史、用药偏好等），将相关信息附加到调用参数中，避免重复询问用户
+- save_memory：当用户提到重要的个人健康信息时（过敏史、慢性病、长期用药等），主动保存到长期记忆
+
+## 工作原则
+
+1. 你绝不直接回答健康相关问题。只要用户提到身体不适、症状、不舒服（如"不舒服"、"不太好"、"有点难受"），无论多模糊，都必须调用 call_inquiry_agent。意图不明确时也默认调 call_inquiry_agent。
+2. 传递消息规则：调用专项助手时，message 参数必须原样传递用户的原始输入，禁止改写、补充指令或添油加醋。如果 search_memory 检索到了相关历史信息，以"[长期记忆] xxx"的格式附加在用户原文之后，不要修改用户原文本身。
+3. 复杂问题可串联：例如用户描述症状后又问用药，先调用 call_inquiry_agent 再调用 call_drug_agent
+4. 患者安全优先：识别到"胸痛"、"呼吸困难"、"意识不清"等急症关键词时，立即提示用户拨打 120 或前往急诊，不要等待问诊流程
+5. 语气温和专业：用患者能理解的语言表达，避免过度使用医学术语"""
+
+
+
+# 创建出 监督 Agent
+async def create_supervisor_agent():
+    # 1. 复用项目已有的 checkpointer 专用 Redis 客户端（bytes 模式）
+    redis_client = get_checkpointer_redis()
+
+    # 2. 创建 AsyncRedisSaver，并调用 asetup() 初始化 RediSearch 索引
+    # asetup() 会在 Redis Stack 中创建 checkpoint / checkpoint_write 两个索引
+    # 必须在首次使用前调用一次，索引已存在时自动跳过，可以重复调用
+    checkpointer = AsyncRedisSaver(redis_client=redis_client)
+    await checkpointer.asetup()
+
+
+    # 3. 长期记忆
+    # ── 长期记忆：Milvus Store ─────────────────────────────────────────
+    milvus_alias = get_milvus_client_alias()
+    embedding_model = _get_embedding_model()
+    store = MilvusStore(
+        alias=milvus_alias,
+        embeddings=embedding_model,
+        dims=1024,   # DashScope text-embedding-v3 默认输出 1024 维
+    )
+
+    # 4. 长期记忆工具
+    tools = [save_memory, search_memory] + WORKER_TOOLS
+
+    # 4. 创建 Agent
+    agent = create_agent(
+        model="deepseek-chat",
+        tools=tools,
+        system_prompt=SUPERVISOR_SYSTEM_PROMPT,
+        context_schema=UserContext,
+        middleware=[
+            SummarizationMiddleware( # 会话总结压缩
+                model="deepseek-chat",
+                trigger=[
+                    ("tokens", 4000),  # token数达到4k时触发
+                    ("messages", 6),  # 或消息数达到 4条时触发
+                    # ("fraction", 0.8)  # 或80%消息时触发
+                ],
+                keep=("messages", 6),  # 摘要后保留最近 4 条消息
+            )
+        ],
+        checkpointer=checkpointer, # 短期记忆. agent chat ui（禁用你配置 checkpointer）
+        store=store # 长期记忆. 把同一个用户，任意会话的有价值信息进行存储。
+    )
+    return agent
+
+
+# 模块级单例：避免每次请求都重新创建 agent 和 checkpointer
+_supervisor_agent = None
+
+# 返回 agent
+async def get_supervisor_agent():
+    """返回全局单例 Agent，首次调用时初始化。"""
+    global _supervisor_agent
+    if _supervisor_agent is None:
+        _supervisor_agent = await create_supervisor_agent()
+    return _supervisor_agent
+
+
+# FastAPI 路由中使用
+async def chat_endpoint(user_id: str, session_id: str, message: str):
+    # 使用单例，不重复初始化。获取 agent
+    agent = await get_supervisor_agent()
+
+    # thread_id 用来区分不同会话。  用户id:会话id:日期（前端传来一个会话id）
+    config = {"configurable": {"thread_id": f"{user_id}:{session_id}"}}
+
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": message}]},
+        config=config,
+        context=UserContext(user_id=user_id, session_id=session_id),
+    )
+    return result["messages"][-1].content
+
+
+
+Bug：业务中的一些细节处理
+1. 问诊工作流 parse_answer 入口无法进入
+原因
+graph.py 中存在两个 bug：
+Bug 1：LangGraph 入口写死，动态路由逻辑无效
+build_inquiry_graph 中入口固定为 load_context：
+graph.set_entry_point("load_context")
+run_inquiry 试图通过 ainvoke 的参数指定起始节点：
+if entry:
+    result = await graph.ainvoke(state, config=config, input={"messages": state.messages})
+但 LangGraph 的 ainvoke 不支持动态指定起始节点，input 参数只是额外输入数据， 不会改变图的执行入口。所以无论 entry 是什么，每次都从 load_context 开始走。
+Bug 2：graph.compile() 返回值被丢弃
+graph.compile()   # 返回 CompiledStateGraph，但被丢弃
+return graph      # 返回的是未编译的 StateGraph
+修复
+在图的入口新增 dispatcher 分发节点，根据 state.round 自动路由：
+def route_dispatcher(state: InquiryState) -> str:
+    if state.round == 0:
+        return "load_context"
+    return "parse_answer"
+图的组装改为：
+graph.add_node("dispatcher", lambda state: {})
+graph.set_entry_point("dispatcher")
+graph.add_conditional_edges("dispatcher", route_dispatcher,
+    {"load_context": "load_context", "parse_answer": "parse_answer"})
+return graph.compile()  # 返回编译后的图
+run_inquiry 中移除无效的 entry 分支逻辑，统一调用：
+result = await graph.ainvoke(state, config=config)
+修复后的执行流程
+- 首轮（round=0）：dispatcher → load_context → check_emergency → extract_symptoms → ...
+- 后续轮次（round>0）：dispatcher → parse_answer → query_neo4j → ...
+
+
+2. Supervisor 拦截模糊症状描述
+用户发送"我不舒服"，期望进入问诊流程（call_inquiry_agent），但 Supervisor 自己回复了，没有调用工具。
+原因
+supervisor_agent.py 中 prompt 写的是"不直接回答专业问题"，DeepSeek 认为"我不舒服"不算专业问题，就自己接了。
+修复
+src/agents/supervisor_agent.py：
+1. 职责描述从"不直接回答专业问题"改为"不直接回答任何健康、医疗、症状相关的问题"
+2. 工作原则第 1 条改为强制规则，明确列举模糊表达也必须调工具：
+你绝不直接回答健康相关问题。只要用户提到身体不适、症状、不舒服
+（如"不舒服"、"不太好"、"有点难受"），无论多模糊，都必须调用
+call_inquiry_agent。意图不明确时也默认调 call_inquiry_agent。
+
+3. 澄清后第二轮用户输入被跳过
+问题
+第一轮用户说"我不舒服"，系统引导澄清。第二轮用户说"头晕"，控制台输出：
+节点⑦解析用户回答 无用户消息或无待解析症状，跳过
+"头晕"没有被提取和标准化，等于这轮输入被吞了。
+原因
+route_dispatcher 把 round > 0 一律路由到 parse_answer：
+def route_dispatcher(state: InquiryState) -> str:
+    if state.round == 0:
+        return "load_context"
+    return "parse_answer"  # round > 0 全部走这里
+但 parse_answer 的前置条件是 pending_ask_symptoms 非空（上一轮通过 ask_symptoms 追问了具体症状）。 上一轮如果是澄清引导（clarify），pending_ask_symptoms 为空，parse_answer 直接跳过， 用户的新症状描述没有经过 extract_symptoms 提取，后续节点拿不到任何新信息。
+两种场景对比：
+暂时无法在飞书文档外展示此内容
+修复
+src/agents/inquiry/graph.py：
+route_dispatcher 根据 pending_ask_symptoms 区分两种场景：
+def route_dispatcher(state: InquiryState) -> str:
+    if state.round == 0:
+        return "load_context"
+    if state.pending_ask_symptoms:
+        return "parse_answer"
+    return "extract_symptoms"
+同时在 dispatcher 的条件边映射中增加 extract_symptoms 目标。
+
+4. 调整：Supervisor 传递消息时禁止改写用户原文
+问题
+用户说"不舒服"，Supervisor 调用 call_inquiry_agent 时，message 参数被改写为：
+用户表示不舒服，但没有具体描述症状。请引导用户详细描述症状，包括：1.具体哪里不舒服（部位）2.症状特点（疼痛性质、程度）3.持续时间4.伴随症状5.加重或缓解因素
+Supervisor 自作主张加了引导指令，干扰了下游 Agent 的判断逻辑（问诊 Agent 自己有澄清引导流程）。
+原因
+工作原则第 2 条写的是"将有价值的信息拼入 message 参数"，给了 Supervisor 自由发挥空间。
+修复
+src/agents/supervisor_agent.py 工作原则第 2 条改为：
+传递消息规则：调用专项助手时，message 参数必须原样传递用户的原始输入，
+禁止改写、补充指令或添油加醋。如果 search_memory 检索到了相关历史信息，
+以"[长期记忆] xxx"的格式附加在用户原文之后，不要修改用户原文本身。
+
+
+测试：整合检查清单
+完成以上所有步骤后，按以下顺序验证：
+1. 端到端测试用例
+启动服务后，用以下 curl 命令测试：
+# 非流式测试
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "user_001",
+    "session_id": "session_001",
+    "message": "我最近头很疼，还有点发烧，肚子也不舒服"
+  }'
+
+# 流式测试
+curl -X POST http://localhost:8000/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "user_id": "user_001",
+    "session_id": "session_001",
+    "message": "我最近头很疼，还有点发烧，肚子也不舒服"
+  }'
+2. 预期对话流程
+暂时无法在飞书文档外展示此内容
+
+附录：InquiryGraph 完整图示
+一、节点架构图
+各节点的职责、依赖的外部系统，以及节点间的数据流向。
+暂时无法在飞书文档外展示此内容
+
+
+---
+二、完整流程图
+每个节点的执行逻辑、条件路由、以及多轮对话的循环结构。
+暂时无法在飞书文档外展示此内容
+
+
+---
+三、InquiryState 状态流转图
+InquiryPhase 枚举在各节点间的流转路径。
+暂时无法在飞书文档外展示此内容
+
+
+四、Graph流程
+[图片]
+
+最后：记忆系统在问诊流程中的使用
+项目实现了两套记忆系统，它们在问诊流程中各司其职，职责边界清晰。
+1. 两套记忆系统总览
+暂时无法在飞书文档外展示此内容
+2. 短期记忆（Redis + AsyncRedisSaver）
+存储内容： Supervisor 的完整对话消息历史，Redis key 格式为 checkpoint:{thread_id}:{checkpoint_id}，每轮对话后由 LangGraph 自动快照。
+在问诊中的参与情况：
+暂时无法在飞书文档外展示此内容
+
+
+注意： 
+1. redis_cache.py 中为 AsyncRedisSaver 单独维护了一个 decode_responses=False 的 bytes 模式连接池（get_checkpointer_redis()）
+2. 与 InquiryGraph 用于存储 inquiry_state 的普通连接池完全隔离，两套 Redis 键互不干扰。
+
+
+
+3. 长期记忆（Milvus + MilvusStore）
+存储内容： 用户跨会话的持久信息，namespace 层级为 ("users", user_id, "memories")，通过 save_memory / search_memory 两个工具操作。
+在问诊中的两个使用时机：
+暂时无法在飞书文档外展示此内容
+
+1. 时机一：问诊首轮，加载历史记忆
+Supervisor 的 system prompt 中明确要求"优先从长期记忆中检索用户历史信息"。
+因此在识别到问诊意图、调用 call_inquiry_agent 之前，Supervisor 会先调用 search_memory 工具，把检索结果放入消息上下文，再由 call_inquiry_agent 工具将其作为 long_term_memories 传入 InquiryState.patient_context。
+
+
+
+2. 时机二：置信度加权，影响诊断排序
+confidence.py 的加权规则直接对应两套记忆的数据来源：
+# src/agents/inquiry/confidence.py
+
+# +0.15 来自 PostgreSQL 历史问诊记录（medical_history 字段）
+for history_item in patient_context.medical_history:
+    if c.name in history_item:
+        score += 0.15
+        break
+
+# +0.10 来自 Milvus 长期记忆（search_memory 检索结果）
+for memory in patient_context.long_term_memories:
+    if c.name in memory:
+        score += 0.10
+        break
+
+3. 时机三：问诊结束，写回诊断结论
+问诊结论需要写回 Milvus，供下次问诊时 search_memory 检索到并加权。在 node_save_record 末尾补充以下代码：
+# src/agents/inquiry/graph.py — node_save_record 末尾追加
+import time as _time
+
+if state.handoff_payload and state.patient_context.patient_id:
+    # 把本次诊断结论存入长期记忆
+    # 下次问诊时 search_memory 能检索到，触发 +0.10 置信度加权
+    memory_content = (
+        f"曾被诊断为「{state.handoff_payload.primary_disease}」，"
+        f"确认症状：{'、'.join(state.handoff_payload.confirmed_symptoms[:5])}"
+    )
+    # deps.store 需要在 InquiryDeps 中传入 MilvusStore 实例
+    await deps.store.aput(
+        namespace=("users", str(state.patient_context.patient_id), "memories"),
+        key=f"diagnosis_{state.session_id}",
+        value={"content": memory_content, "timestamp": _time.time()},
+    )
+同时需要在 InquiryDeps 中增加 store 字段：
+# src/agents/inquiry/graph.py — InquiryDeps 增加 store 字段
+class InquiryDeps:
+    def __init__(self, llm, neo4j_driver, embedding_model, milvus_client, db_session, store=None):
+        self.llm = llm
+        self.neo4j_driver = neo4j_driver
+        self.embedding_model = embedding_model
+        self.milvus_client = milvus_client
+        self.db_session = db_session
+        self.store = store  # MilvusStore 实例，用于写回长期记忆
+在 build_inquiry_deps 中传入 MilvusStore 实例：
+# src/agents/inquiry/graph.py — build_inquiry_deps 追加
+from src.infra.milvus_store import MilvusStore
+from langchain_openai import OpenAIEmbeddings
+
+def build_inquiry_deps(db_session=None) -> InquiryDeps:
+    # ... 原有代码不变 ...
+
+    # 新增：传入 MilvusStore 实例，用于写回长期记忆
+    embedding_for_store = OpenAIEmbeddings(
+        model=settings.EMBEDDING_MODEL,
+        openai_api_key=settings.DEEPSEEK_API_KEY,
+        openai_api_base=settings.BASE_URL_CHAT,
+        dimensions=1024,
+    )
+    store = MilvusStore(
+        alias=get_milvus_client_alias(),
+        embeddings=embedding_for_store,
+        dims=1024,
+    )
+
+    return InquiryDeps(
+        llm=llm,
+        neo4j_driver=neo4j_driver,
+        embedding_model=embedding_model,
+        milvus_client=milvus_client,
+        db_session=db_session,
+        store=store,  # 新增
+    )
+
+4. 完整记忆闭环
+两套记忆系统在问诊全生命周期中形成闭环：
+暂时无法在飞书文档外展示此内容

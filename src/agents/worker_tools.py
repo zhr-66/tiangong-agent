@@ -1,23 +1,90 @@
+# src/agents/worker_tools.py
+
+from dataclasses import dataclass
+
 from langchain_core.tools import tool
-from src.agents.workers.inquiry_agent import get_inquiry_agent
+from langgraph.prebuilt import ToolRuntime
+
 from src.agents.workers.report_agent import get_report_agent
 from src.agents.workers.drug_agent import get_drug_agent
 from src.agents.workers.knowledge_agent import get_knowledge_agent
 from src.agents.workers.operation_agent import get_operation_agent
 
+from src.agents.inquiry.graph import run_inquiry, build_inquiry_deps
+from src.agents.inquiry.state import InquiryPhase
+from src.agents.workers.inquiry_agent import handle_handoff
+from src.infra.redis_cache import get_checkpointer_redis
+from src.core.config import get_settings
 
+settings = get_settings()
+
+
+@dataclass
+class UserContext:  # 用户上下文
+    user_id: str
+    session_id: str
+
+
+def _parse_thread_id(runtime: ToolRuntime) -> tuple[str, str]:
+    """
+    从 runtime.config 的 thread_id 中解析 (user_id, session_id)。
+    thread_id 格式约定为 "{user_id}:{session_id}"。
+    无法解析时返回 ("", "")。
+    """
+    configurable = runtime.config.get("configurable") or {}
+    thread_id = configurable.get("thread_id") or ""
+    parts = thread_id.split(":", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return "", ""
+
+
+# 仅第一轮会发起调用
 @tool
-async def call_inquiry_agent(message: str) -> str:
+async def call_inquiry_agent(message: str, runtime: ToolRuntime) -> str:
     """
-    调用智慧问诊Agent，对患者进行智能分诊。
-    适用场景：患者描述症状、询问挂哪个科室、需要预约挂号时。
-    message: 患者描述的症状或问诊需求。
+    启动智慧问诊流程。
+    适用场景：患者首次描述症状、询问挂哪个科室时。
+    后续多轮对话由系统自动路由，无需再次调用此工具。
+
+    Args:
+        message    : 患者描述的症状或问诊需求
     """
-    agent = get_inquiry_agent()
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": message}]}
+    # 获取当前会话 ID 和用户 ID
+    user_id, session_id = _parse_thread_id(runtime)
+    print("🔧工具调用 call_inquiry_agent :", session_id, message)
+
+    deps = build_inquiry_deps()
+
+    # 首轮：初始化空状态，执行第一轮问诊; 调用工作流
+    reply, new_state = await run_inquiry(
+        user_message=message,
+        thread_id=f"{user_id}:{session_id}",
+        deps=deps,
+        existing_state=None,  # 首轮，无历史状态
+        user_id=user_id,
     )
-    return result["messages"][-1].content
+
+    # 首轮即收敛（精确症状/急症等）：触发挂号移交，不设活跃标记
+    if new_state.phase == InquiryPhase.END:
+        if new_state.handoff_payload:
+            handoff_reply = await handle_handoff(new_state.handoff_payload)
+            return f"{reply}\n\n---\n{handoff_reply}"
+        return reply
+
+    # 问诊未结束：保存状态，设置活跃标记，等待后续轮次
+    redis = get_checkpointer_redis()
+    state_key = f"inquiry_state:{user_id}:{session_id}"
+    await redis.set(
+        state_key,
+        new_state.model_dump_json(),
+        ex=3600,  # 1 小时过期
+    )
+
+    active_key = f"inquiry_active:{user_id}:{session_id}"
+    await redis.set(active_key, "1", ex=3600)
+
+    return reply
 
 
 @tool
