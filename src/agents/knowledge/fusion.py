@@ -1,3 +1,14 @@
+"""
+多通道融合检索模块。
+
+职责：
+1. 并行调用多个检索通道（文档 RAG、GraphRAG、NL2SQL）
+2. 汇总各通道结果，交给 LLM 融合生成统一回答
+3. 对融合回答做幻觉检测，不达标时附加风险提示
+
+典型场景：复杂问题需要同时查多个来源才能回答
+"""
+
 from __future__ import annotations
 import asyncio
 from loguru import logger

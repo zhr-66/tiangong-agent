@@ -1,3 +1,15 @@
+"""
+GraphRAG 模块：基于 Neo4j 知识图谱的检索增强生成。
+
+职责：
+1. 从用户问题中提取医学实体（疾病、症状、药物、科室、检查项目）
+2. 将自然语言翻译为 Cypher 查询语句（NL2Cypher），支持错误重试
+3. 在 Neo4j 中执行 Cypher，获取图谱关系数据
+4. 将图谱查询结果交给 LLM 整合为自然语言回答
+
+典型场景：查询实体间关系，如"高血压有哪些常用药"、"糖尿病的并发症是什么"
+"""
+
 from __future__ import annotations
 import json
 from loguru import logger
@@ -9,9 +21,10 @@ from src.agents.knowledge.prompts import (
     ENTITY_EXTRACT_PROMPT, NL2CYPHER_PROMPT, GRAPH_QA_PROMPT,
 )
 
-MAX_CYPHER_RETRIES = 2
+MAX_CYPHER_RETRIES = 2  #表示 Cypher 执行失败后最多重试 2 次 ，但加上第1次初始尝试，总共最多执行 3 次 ：
 
 
+# 实体提取
 async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
     prompt = ENTITY_EXTRACT_PROMPT.format(question=question)
     response = await llm.ainvoke([SystemMessage(content=prompt)])
@@ -24,7 +37,7 @@ async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
         logger.warning(f"实体提取失败: {e}")
         return {"diseases": [], "symptoms": [], "drugs": [], "departments": [], "checks": []}
 
-
+# 在 Neo4j 中生成 Cypher 查询语句
 async def _generate_cypher(
     question: str, entities: dict, llm: BaseChatModel, error_hint: str = "",
 ) -> str:
@@ -41,7 +54,7 @@ async def _generate_cypher(
         cypher = cypher.split("```")[1].lstrip("cypher").strip()
     return cypher
 
-
+# 执行查询语句
 async def _execute_cypher(cypher: str, neo4j_driver: AsyncDriver) -> list[dict]:
     if not cypher:
         return []
@@ -49,22 +62,22 @@ async def _execute_cypher(cypher: str, neo4j_driver: AsyncDriver) -> list[dict]:
         result = await session.run(cypher)
         return await result.data()
 
-
+# 检索原始数据
 async def search_graph_raw(
     question: str,
     neo4j_driver: AsyncDriver,
     llm: BaseChatModel,
 ) -> list[dict]:
     """GraphRAG 检索，返回原始图谱查询结果（不经过 LLM 生成）。"""
-    entities = await _extract_entities(question, llm)
+    entities = await _extract_entities(question, llm)       # 实体提取
     logger.info(f"GraphRAG 实体提取: {entities}")
 
     error_hint = ""
     for attempt in range(MAX_CYPHER_RETRIES + 1):
-        cypher = await _generate_cypher(question, entities, llm, error_hint)
+        cypher = await _generate_cypher(question, entities, llm, error_hint)    # 生成 Cypher 查询语句（考虑上一次报错）
         logger.info(f"GraphRAG Cypher (attempt {attempt + 1}): {cypher}")
         try:
-            records = await _execute_cypher(cypher, neo4j_driver)
+            records = await _execute_cypher(cypher, neo4j_driver)    # 执行 Cypher 查询语句
             return records[:20]
         except Exception as e:
             error_hint = str(e)
@@ -73,7 +86,7 @@ async def search_graph_raw(
                 return []
     return []
 
-
+# 入口
 async def search_graph(
     question: str,
     neo4j_driver: AsyncDriver,
@@ -86,7 +99,7 @@ async def search_graph(
         return "知识图谱中未找到与您问题相关的信息。"
 
     graph_result = json.dumps(records, ensure_ascii=False, indent=2)
-    prompt = GRAPH_QA_PROMPT.format(
+    prompt = GRAPH_QA_PROMPT.format(            #根据知识图谱查询结果回答用户问题
         question=question, graph_result=graph_result, role=role,
     )
     response = await llm.ainvoke([SystemMessage(content=prompt)])

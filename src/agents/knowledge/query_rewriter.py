@@ -1,3 +1,11 @@
+"""
+查询改写模块。
+
+职责：
+将用户的口语化提问改写为适合检索的规范化医学查询，
+补充隐含上下文，拆分多子问题，识别查询意图。
+"""
+
 from __future__ import annotations
 import json
 from loguru import logger

@@ -1,3 +1,14 @@
+"""
+Prompt 模板集中管理模块。
+
+职责：
+定义知识问答 Agent 所需的全部 Prompt 模板，包括：
+- 查询改写、HyDE 生成、文档 QA、实体提取
+- NL2Cypher、图谱 QA、NL2SQL、SQL QA
+- 多通道融合、幻觉检测、处方审核
+- 查询路由分类
+"""
+
 from __future__ import annotations
 
 

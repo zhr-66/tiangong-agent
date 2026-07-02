@@ -1,3 +1,11 @@
+"""
+知识更新通知模块。
+
+职责：
+文档上传/更新/删除时记录通知，供相关科室查询未读通知，
+支持按分类筛选和标记已读。
+"""
+
 from __future__ import annotations
 from datetime import datetime
 from loguru import logger

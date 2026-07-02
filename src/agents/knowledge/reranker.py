@@ -1,3 +1,11 @@
+"""
+Reranker 精排模块。
+
+职责：
+使用 DashScope Reranker 对向量粗检索结果做二次精排，
+按相关性重排序后返回 top_k 结果，提升检索精度。
+"""
+
 from __future__ import annotations
 from loguru import logger
 

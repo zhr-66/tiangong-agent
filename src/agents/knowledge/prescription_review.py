@@ -1,3 +1,14 @@
+"""
+处方审核模块。
+
+职责：
+1. 从自然语言中解析处方信息（药品、剂量、过敏史等）
+2. 并行执行四项校验：剂量校验、配伍校验、过敏校验、重复用药检查
+3. LLM 汇总校验结果，生成结构化处方审核报告
+
+典型场景：药师审核处方，如"阿莫西林0.5g tid + 甲硝唑0.4g bid，患者对青霉素过敏"
+"""
+
 from __future__ import annotations
 import asyncio
 import json
@@ -15,6 +26,7 @@ from src.agents.knowledge.doc_rag import search_docs_raw, format_doc_context
 from src.agents.knowledge.graph_rag import search_graph_raw
 
 
+# 从自然语言中解析处方结构化信息（药品名、剂量、频次、过敏史等）
 async def _parse_prescription(question: str, llm: BaseChatModel) -> dict:
     prompt = PRESCRIPTION_PARSE_PROMPT.format(question=question)
     response = await llm.ainvoke([SystemMessage(content=prompt)])
@@ -28,6 +40,7 @@ async def _parse_prescription(question: str, llm: BaseChatModel) -> dict:
         return {"drugs": [], "patient_info": {"allergies": [], "diseases": []}}
 
 
+# 剂量校验：从文档库检索药品说明书，对比用户输入的剂量是否在推荐范围内
 async def _check_dosage(
     drug_name: str,
     dosage: str | None,
@@ -49,6 +62,7 @@ async def _check_dosage(
     }
 
 
+# 配伍校验：从知识图谱查询药物间的相互作用和配伍禁忌，单药时跳过
 async def _check_interaction(
     drug_names: list[str],
     neo4j_driver: AsyncDriver,
@@ -68,9 +82,10 @@ async def _check_interaction(
     }
 
 
+# 过敏校验：两层检测——字符串精确匹配 + 图谱成分级交叉过敏匹配
 async def _check_allergy(
     drug_names: list[str],
-    allergies: list[str],
+    allergies: list[str],  # 患者过敏史（如青霉素、花粉等）
     neo4j_driver: AsyncDriver,
     llm: BaseChatModel,
 ) -> dict:
@@ -122,6 +137,7 @@ async def _check_allergy(
     }
 
 
+# 重复用药检查：检查处方中是否有同名药品重复出现
 async def _check_duplicate(drug_list: list[dict]) -> dict:
     categories = {}
     for d in drug_list:
@@ -136,6 +152,7 @@ async def _check_duplicate(drug_list: list[dict]) -> dict:
     }
 
 
+# 处方审核入口：解析处方 → 并行执行四项校验 → LLM 汇总生成审核报告
 async def review_prescription(
     question: str,
     llm: BaseChatModel,
@@ -147,7 +164,7 @@ async def review_prescription(
     处方审核完整流程：
     解析处方 → 并行校验（剂量/配伍/过敏/重复）→ LLM 生成审核报告。
     """
-    prescription = await _parse_prescription(question, llm)
+    prescription = await _parse_prescription(question, llm)   # 解析处方结构化信息
     drugs = prescription.get("drugs", [])
     patient = prescription.get("patient_info", {})
 
@@ -158,13 +175,13 @@ async def review_prescription(
     allergies = patient.get("allergies", []) or []
 
     tasks = [
-        _check_interaction(drug_names, neo4j_driver, llm),
-        _check_allergy(drug_names, allergies, neo4j_driver, llm),
-        _check_duplicate(drugs),
+        _check_interaction(drug_names, neo4j_driver, llm), # 药物相互作用校验
+        _check_allergy(drug_names, allergies, neo4j_driver, llm), # 过敏校验
+        _check_duplicate(drugs), # 重复用药检查
     ]
     for d in drugs:
         if d.get("name"):
-            tasks.append(_check_dosage(
+            tasks.append(_check_dosage(     # 每个药一个剂量校验
                 d["name"], d.get("dosage"),
                 embedding_model, milvus_client,
             ))

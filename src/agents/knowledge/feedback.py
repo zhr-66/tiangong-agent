@@ -1,3 +1,11 @@
+"""
+用户反馈模块。
+
+职责：
+收集用户对知识问答的回答质量反馈（点赞/踩），
+支持按评分统计，用于持续优化检索和生成效果。
+"""
+
 from __future__ import annotations
 from datetime import datetime
 from loguru import logger

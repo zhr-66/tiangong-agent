@@ -1,3 +1,13 @@
+"""
+知识问答 Agent 模块包。
+
+统一导出知识问答所需的全部组件：
+- 检索引擎：文档 RAG、GraphRAG、NL2SQL、多通道融合
+- 增强能力：查询改写、HyDE、Reranker、幻觉检测
+- 业务模块：处方审核、文档导入、对话上下文
+- 运维模块：审计日志、用户反馈、知识更新通知
+"""
+
 from __future__ import annotations
 
 from .prompts import (

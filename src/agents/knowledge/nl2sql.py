@@ -1,3 +1,15 @@
+"""
+NL2SQL 模块。
+
+职责：
+1. LLM 将自然语言翻译为 SQL 查询语句
+2. 安全校验：只允许 SELECT，禁止敏感字段，强制 LIMIT
+3. 执行查询（带超时保护和错误重试）
+4. LLM 将查询结果整合为自然语言回答
+
+典型场景：查询统计数据，如"本月内科问诊量多少"、"库存不足的药品有哪些"
+"""
+
 from __future__ import annotations
 import asyncio
 import re
@@ -19,6 +31,7 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
+#检验SQL安全
 def _validate_sql(sql: str) -> tuple[bool, str]:
     stripped = sql.strip().rstrip(";")
     if not stripped.upper().startswith("SELECT"):
@@ -31,6 +44,7 @@ def _validate_sql(sql: str) -> tuple[bool, str]:
     return True, stripped
 
 
+# 生成 SQL
 async def _generate_sql(
     question: str, llm: BaseChatModel, error_hint: str = "",
 ) -> str:
@@ -44,7 +58,7 @@ async def _generate_sql(
         sql = sql.split("```")[1].lstrip("sql").strip()
     return sql
 
-
+# 检索原始数据
 async def search_sql_raw(
     question: str,
     llm: BaseChatModel,
@@ -54,10 +68,10 @@ async def search_sql_raw(
     error_hint = ""
     validated_sql = ""
     for attempt in range(MAX_SQL_RETRIES + 1):
-        raw_sql = await _generate_sql(question, llm, error_hint)
+        raw_sql = await _generate_sql(question, llm, error_hint)        # 生成 SQL
         logger.info(f"NL2SQL SQL (attempt {attempt + 1}): {raw_sql}")
 
-        valid, validated = _validate_sql(raw_sql)
+        valid, validated = _validate_sql(raw_sql)   # 校验 SQL 安全
         validated_sql = validated
         if not valid:
             logger.warning(f"SQL 安全校验失败: {validated}")
@@ -65,7 +79,7 @@ async def search_sql_raw(
 
         try:
             query_result = await asyncio.wait_for(
-                db.execute(text(validated)),
+                db.execute(text(validated)),    # 执行 SQL 查询
                 timeout=SQL_TIMEOUT_SECONDS,
             )
             rows = query_result.mappings().all()
@@ -93,12 +107,12 @@ async def search_sql(
     llm: BaseChatModel,
     db: AsyncSession,
 ) -> str:
-    result = await search_sql_raw(question, llm, db)
+    result = await search_sql_raw(question, llm, db)     # 检索原始数据
     if isinstance(result, str):
         return result
     
     data, validated_sql = result
     result_str = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     prompt = SQL_QA_PROMPT.format(question=question, sql=validated_sql, result=result_str)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await llm.ainvoke([SystemMessage(content=prompt)])    # 调用大模型，根据查询结果生成回答
     return response.content

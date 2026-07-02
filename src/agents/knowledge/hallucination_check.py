@@ -1,3 +1,11 @@
+"""
+幻觉检测模块。
+
+职责：
+校验 LLM 回答是否完全基于检索结果，识别无依据的陈述。
+医疗场景对幻觉零容忍，不达阈值的回答会附加风险提示。
+"""
+
 from __future__ import annotations
 import json
 from loguru import logger

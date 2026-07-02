@@ -1,3 +1,15 @@
+"""
+文档 RAG 模块。
+
+职责：
+1. HyDE 增强：生成假设文档向量，提升召回率
+2. Milvus 向量粗检索：从知识库中召回 top_k 文档片段
+3. Reranker 精排：对粗检索结果做二次排序
+4. LLM 生成回答：基于精排后的文档片段生成自然语言回答
+
+典型场景：查询文档内容，如"阿莫西林说明书怎么说"、"高血压诊疗指南有哪些推荐"
+"""
+
 from __future__ import annotations
 from loguru import logger
 from langchain_core.messages import SystemMessage
@@ -11,18 +23,18 @@ COLLECTION_NAME = "knowledge_docs"
 
 
 async def search_docs_raw(
-    question: str,
-    embedding_model: Embeddings,
-    milvus_client: MilvusClient,
-    top_k: int = 20,
-    rerank_top_k: int = 5,
-    doc_type: str | None = None,
-    llm: BaseChatModel | None = None,
-    use_hyde: bool = False,
+    question: str,      # 用户原始问题
+    embedding_model: Embeddings,    # 向量化模型
+    milvus_client: MilvusClient,    
+    top_k: int = 20,     # 向量初召回最多20条
+    rerank_top_k: int = 5,   # Reranker精排后保留5条最优片段
+    doc_type: str | None = None,    # 过滤文档类型（如指南/病历/教材）
+    llm: BaseChatModel | None = None,   # HyDE需要的大模型
+    use_hyde: bool = False,     # 是否开启HyDE假设文档增强
 ) -> list[dict]:
     if use_hyde and llm is not None:
-        from src.agents.knowledge.hyde import generate_hyde_embedding
-        query_vec = await generate_hyde_embedding(question, llm, embedding_model)
+        from src.agents.knowledge.hyde import generate_hyde_embedding      
+        query_vec = await generate_hyde_embedding(question, llm, embedding_model)   # 生成假设回答的向量
     else:
         query_vec = await embedding_model.aembed_query(question)
 
@@ -30,6 +42,7 @@ async def search_docs_raw(
     filter_expr = f'doc_type == "{doc_type}"' if doc_type else None
 
     try:
+        # 向量初召回
         results = milvus_client.search(
             collection_name=COLLECTION_NAME,
             data=[query_vec],
@@ -51,7 +64,7 @@ async def search_docs_raw(
     ]
 
     from src.agents.knowledge.reranker import rerank_docs
-    reranked = await rerank_docs(question, hits, top_k=rerank_top_k)
+    reranked = await rerank_docs(question, hits, top_k=rerank_top_k)     # Reranker精排
     return reranked
 
 
@@ -79,6 +92,7 @@ async def search_docs(
     role: str = "patient",
     use_hyde: bool = True,
 ) -> str:
+    """HyDE 增强 + 文档 RAG 检索 + Reranker 精排 + 生成回答。"""
     hits = await search_docs_raw(
         question, embedding_model, milvus_client,
         top_k=top_k, rerank_top_k=rerank_top_k, doc_type=doc_type,

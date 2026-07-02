@@ -1,3 +1,11 @@
+"""
+多轮对话上下文管理模块。
+
+职责：
+基于 Redis 存储同一会话的知识问答历史，支持加载、追加、保存，
+为多轮问答提供上下文 continuity。
+"""
+
 from __future__ import annotations
 import json
 from loguru import logger

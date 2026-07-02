@@ -1,3 +1,13 @@
+"""
+文档导入模块。
+
+职责：
+1. 解析多种格式文档（PDF、Word、TXT、Markdown）
+2. 文本分块（按固定长度 + 语义边界切分）
+3. 向量化后写入 Milvus knowledge_docs collection
+4. 支持从 PostgreSQL 药品表批量导入药品说明书
+"""
+
 from __future__ import annotations
 import os
 import hashlib

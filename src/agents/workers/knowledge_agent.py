@@ -6,11 +6,13 @@ from pymilvus import MilvusClient
 from langchain_core.messages import SystemMessage
 
 from src.core.config import get_settings
+from src.infra.redis_cache import get_redis_client
 from src.agents.knowledge import (
     rewrite_query, ROUTE_PROMPT,
     search_docs, search_graph, search_sql,
     multi_channel_search, review_prescription,
     QueryAuditLog, Timer,
+    load_conversation_context, format_context, append_turn,
 )
 
 settings = get_settings()
@@ -60,7 +62,7 @@ class KnowledgeAgent:
     async def _route_query(self, question: str) -> dict:
         prompt = ROUTE_PROMPT.format(question=question)
         try:
-            response = await self.llm.ainvoke([SystemMessage(content=prompt)])
+            response = await self.llm.ainvoke([SystemMessage(content=prompt)]) #判断用户问题应该使用哪种检索方式
             content = response.content.strip()
             if "```" in content:
                 content = content.split("```")[1].lstrip("json").strip()
@@ -104,10 +106,21 @@ class KnowledgeAgent:
             await self.initialize()
 
         with Timer() as timer:
-            rewrite_result = await rewrite_query(question, self.llm, role)
+            # 加载多轮对话上下文
+            redis_client = await get_redis_client()
+            history = await load_conversation_context(redis_client, user_id, session_id)
+            context_text = format_context(history)
+
+            # 有历史上下文时，增强问题以便 LLM 理解指代关系
+            if context_text:
+                enriched_question = f"{context_text}\n\n当前问题：{question}"
+            else:
+                enriched_question = question
+
+            rewrite_result = await rewrite_query(enriched_question, self.llm, role)  # 改写口语
             intent = rewrite_result.get("intent", "knowledge_qa")
 
-            route_result = await self._route_query(question)
+            route_result = await self._route_query(enriched_question) #判断用户问题应该使用哪种检索方式
             route = route_result.get("route", "doc_rag")
 
             logger.info(
@@ -118,28 +131,28 @@ class KnowledgeAgent:
             if route == "prescription":
                 neo4j_driver = await self._get_neo4j_driver()
                 answer = await review_prescription(
-                    question, self.llm, self.embedding_model,
+                    enriched_question, self.llm, self.embedding_model,
                     self.milvus_client, neo4j_driver,
                 )
                 channels = ["prescription"]
 
             elif route == "graph_rag":
                 neo4j_driver = await self._get_neo4j_driver()
-                answer = await search_graph(question, neo4j_driver, self.llm, role)
+                answer = await search_graph(enriched_question, neo4j_driver, self.llm, role)
                 channels = ["graph_rag"]
 
             elif route == "nl2sql":
                 if db_session is None:
                     db_session = await self._get_db_session()
-                answer = await search_sql(question, self.llm, db_session)
+                answer = await search_sql(enriched_question, self.llm, db_session)
                 channels = ["nl2sql"]
 
             elif route == "multi":
                 neo4j_driver = await self._get_neo4j_driver()
                 if db_session is None:
                     db_session = await self._get_db_session()
-                answer = await multi_channel_search(
-                    question, self.llm, self.embedding_model,
+                answer = await multi_channel_search(    # 多通道检索
+                    enriched_question, self.llm, self.embedding_model,
                     self.milvus_client, neo4j_driver, db_session,
                     channels=["doc_rag", "graph_rag"],
                     role=role,
@@ -147,7 +160,11 @@ class KnowledgeAgent:
                 channels = ["doc_rag", "graph_rag"]
 
             else:
-                answer, channels = await self._search_docs_with_graph_fallback(question, role)
+                answer, channels = await self._search_docs_with_graph_fallback(enriched_question, role)
+
+            # 保存本轮对话到上下文
+            if user_id and session_id:
+                await append_turn(redis_client, user_id, session_id, question, answer)
 
             QueryAuditLog.log(
                 user_id=user_id,

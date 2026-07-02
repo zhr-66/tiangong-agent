@@ -1,3 +1,11 @@
+"""
+查询审计日志模块。
+
+职责：
+记录每次知识检索的完整链路，包括用户信息、查询意图、检索通道、
+耗时、幻觉检测结果等，用于运维监控和效果分析。
+"""
+
 from __future__ import annotations
 import time
 from loguru import logger
