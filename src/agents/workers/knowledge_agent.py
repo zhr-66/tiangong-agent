@@ -143,11 +143,14 @@ class KnowledgeAgent:
 
             # 改写：解析指代、补全省略，输出具体可检索的问题
             rewrite_result = await rewrite_query(rewrite_input, self.llm, role)
-            rewritten = rewrite_result.get("queries", [question])[0]
+            queries = rewrite_result.get("queries", [question])
+            rewritten = queries[0] if queries else question
             intent = rewrite_result.get("intent", "knowledge_qa")
 
-            # 路由用改写后的问题（"维C银翘片和氨氯地平能一起吃吗"→prescription）
-            route_result = await self._route_query(rewritten)
+            # 路由用原始问题（改写可能拆分成多个子查询，只用第一个会丢失意图）
+            # 但如果有上下文改写（解析指代），用 rewrite_input 更准确
+            route_input = rewrite_input if context_text else question
+            route_result = await self._route_query(route_input)
             route = route_result.get("route", "doc_rag")
 
             # 最终 LLM 生成回答时用含上下文的问题
@@ -181,14 +184,14 @@ class KnowledgeAgent:
                 neo4j_driver = await self._get_neo4j_driver()
                 if db_session is None:
                     db_session = await self._get_db_session()
-                answer = await multi_channel_search(    # 多通道检索
+                answer, channels = await multi_channel_search(    # 多通道检索
                     rewritten, self.llm, self.embedding_model,
                     self.milvus_client, neo4j_driver, db_session,
                     channels=["doc_rag", "graph_rag"],
                     role=role,
                     context_text=answer_question,
+                    sub_queries=queries if len(queries) > 1 else None,
                 )
-                channels = ["doc_rag", "graph_rag"]
 
             else:
                 answer, channels = await self._search_docs_with_graph_fallback(rewritten, role, context_text=answer_question)

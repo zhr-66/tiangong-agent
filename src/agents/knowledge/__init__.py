@@ -16,6 +16,7 @@ from .prompts import (
     NL2SQL_PROMPT, SQL_QA_PROMPT, FUSION_PROMPT,
     HALLUCINATION_CHECK_PROMPT, PRESCRIPTION_PARSE_PROMPT,
     PRESCRIPTION_REPORT_PROMPT, ROUTE_PROMPT,
+    EVIDENCE_SUFFICIENCY_PROMPT,
 )
 from .query_rewriter import rewrite_query
 from .hyde import generate_hyde_embedding
@@ -45,7 +46,7 @@ __all__ = [
     "search_graph", "search_graph_raw",
     "search_sql", "search_sql_raw",
     "check_hallucination",
-    "multi_channel_search",
+    "multi_channel_search", "_check_evidence_sufficiency",
     "review_prescription",
     "QueryAuditLog", "Timer",
     "save_feedback", "get_feedback_stats",
