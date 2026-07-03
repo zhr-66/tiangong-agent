@@ -7,6 +7,7 @@ from typing import Any
 
 from loguru import logger
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from src.agents.llm_utils import ainvoke_with_timeout
 from langchain_deepseek import ChatDeepSeek
 from langchain_community.embeddings import DashScopeEmbeddings
 from langgraph.graph import StateGraph, END
@@ -112,7 +113,7 @@ async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
         return {}
 
     prompt = EMERGENCY_CHECK_PROMPT.format(user_input=last_user_msg)
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(deps.llm, [SystemMessage(content=prompt)], step="inquiry.llm")
     try:
         content = response.content.strip()
         if "```" in content:
@@ -196,7 +197,7 @@ async def node_clarify(state: InquiryState, deps: InquiryDeps) -> dict:
 
     logger.info("节点④澄清模糊描述 用户描述模糊，发起澄清引导 | round={}", state.round)
     prompt = CLARIFY_PROMPT.format(user_input=last_user_msg)
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(deps.llm, [SystemMessage(content=prompt)], step="inquiry.llm")
     logger.debug("节点④澄清模糊描述 澄清回复已生成，等待用户下一轮输入")
     return {
         "round": state.round + 1,
@@ -277,7 +278,7 @@ async def node_ask_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
     prompt = ASK_SYMPTOMS_PROMPT.format(
         symptoms_to_ask="\n".join(f"- {s}" for s in human_symptoms)
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(deps.llm, [SystemMessage(content=prompt)], step="inquiry.llm")
 
     return {
         "round": state.round + 1,
@@ -309,7 +310,7 @@ async def node_parse_answer(state: InquiryState, deps: InquiryDeps) -> dict:
         asked_symptoms=", ".join(state.pending_ask_symptoms),
         user_answer=last_user_msg,
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(deps.llm, [SystemMessage(content=prompt)], step="inquiry.llm")
 
     try:
         content = response.content.strip()
@@ -368,7 +369,7 @@ async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
         checks="、".join(top1.checks[:5]) if top1.checks else "暂无",
         force_conclude=state.force_conclude,
     )
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(deps.llm, [SystemMessage(content=prompt)], step="inquiry.llm")
 
     # 构建移交数据包（挂号数据包）
     handoff = InquiryHandoffPayload(

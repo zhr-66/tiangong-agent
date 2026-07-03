@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "medical123"
 
+    # MinerU 文档解析
+    MINERU_API_URL: str = "http://localhost:8001"
+    MINERU_BACKEND: str = "pipeline"
+    MINERU_TIMEOUT: int = 300
+
     # 模型
     DASHSCOPE_API_KEY: str = ""
        # 聊天模型

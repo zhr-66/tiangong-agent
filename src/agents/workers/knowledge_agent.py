@@ -1,9 +1,11 @@
 from __future__ import annotations
+import asyncio
 import json
 from loguru import logger
 from langchain_community.embeddings import DashScopeEmbeddings
 from pymilvus import MilvusClient
 from langchain_core.messages import SystemMessage
+from src.agents.llm_utils import ainvoke_with_timeout
 
 from src.core.config import get_settings
 from src.infra.redis_cache import get_redis_client
@@ -28,6 +30,7 @@ class KnowledgeAgent:
         self.embedding_model = None
         self.milvus_client = None
         self.neo4j_driver = None
+        self._docs_collection_available: bool | None = None
         self._initialized = False
 
     async def initialize(self):
@@ -62,7 +65,11 @@ class KnowledgeAgent:
     async def _route_query(self, question: str) -> dict:
         prompt = ROUTE_PROMPT.format(question=question)
         try:
-            response = await self.llm.ainvoke([SystemMessage(content=prompt)]) #判断用户问题应该使用哪种检索方式
+            response = await ainvoke_with_timeout(
+                self.llm,
+                [SystemMessage(content=prompt)],
+                step="knowledge.route_query",
+            )
             content = response.content.strip()
             if "```" in content:
                 content = content.split("```")[1].lstrip("json").strip()
@@ -78,7 +85,24 @@ class KnowledgeAgent:
         async for db in get_db():
             return db
 
+    def _has_docs_collection(self) -> bool:
+        if self._docs_collection_available is not None:
+            return self._docs_collection_available
+        try:
+            from src.agents.knowledge.doc_rag import COLLECTION_NAME
+
+            self._docs_collection_available = self.milvus_client.has_collection(COLLECTION_NAME)
+        except Exception as e:
+            logger.warning("Knowledge docs collection check failed: {}", e)
+            self._docs_collection_available = False
+        return self._docs_collection_available
+
     async def _search_docs_with_graph_fallback(self, question: str, role: str) -> tuple[str, list[str]]:
+        if not self._has_docs_collection():
+            logger.info("Knowledge docs collection is unavailable; using GraphRAG directly")
+            neo4j_driver = await self._get_neo4j_driver()
+            return await search_graph(question, neo4j_driver, self.llm, role), ["graph_rag"]
+
         answer = await search_docs(
             question, self.embedding_model, self.milvus_client,
             self.llm, role=role, use_hyde=True,
@@ -117,10 +141,12 @@ class KnowledgeAgent:
             else:
                 enriched_question = question
 
-            rewrite_result = await rewrite_query(enriched_question, self.llm, role)  # 改写口语
+            rewrite_result, route_result = await asyncio.gather(
+                rewrite_query(enriched_question, self.llm, role),
+                self._route_query(enriched_question),
+            )
             intent = rewrite_result.get("intent", "knowledge_qa")
-
-            route_result = await self._route_query(enriched_question) #判断用户问题应该使用哪种检索方式
+            route = route_result.get("route", "doc_rag")
             route = route_result.get("route", "doc_rag")
 
             logger.info(

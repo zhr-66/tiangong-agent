@@ -13,6 +13,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.language_models import BaseChatModel
 
 from src.agents.knowledge.prompts import QUERY_REWRITE_PROMPT
+from src.agents.llm_utils import ainvoke_with_timeout
 
 
 async def rewrite_query(
@@ -25,8 +26,12 @@ async def rewrite_query(
     返回 {"queries": [...], "intent": "..."}
     """
     prompt = QUERY_REWRITE_PROMPT.format(question=question, role=role)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
     try:
+        response = await ainvoke_with_timeout(
+            llm,
+            [SystemMessage(content=prompt)],
+            step="knowledge.query_rewrite",
+        )
         content = response.content.strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()

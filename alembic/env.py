@@ -11,6 +11,7 @@ from src.core.config import get_settings
 
 # 这里要导入所有模型模块，确保 metadata 收集到全部表
 from src.modules.medical.model import *
+from src.agents.knowledge.model import *    # 知识问答：反馈表、通知表
 
 config = context.config
 

@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
 from src.infra.database import get_db
+from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.minio_client import upload_file as minio_upload
 from src.agents.knowledge import (
     ingest_file, ensure_knowledge_collection,
     save_feedback, get_feedback_stats,
@@ -26,6 +28,7 @@ def _get_deps():
         model=settings.EMBEDDING_MODEL,
         dashscope_api_key=settings.DASHSCOPE_API_KEY,
     )
+    get_milvus_client_alias()
     milvus_client = MilvusClient(
         uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
     )
@@ -44,6 +47,13 @@ async def upload_document(
         raise HTTPException(400, f"不支持的文件格式: {ext}，支持: {allowed_ext}")
 
     content = await file.read()
+
+    # 存原始文件到 MinIO
+    minio_key = f"knowledge/{doc_type}/{file.filename}"
+    try:
+        minio_upload(minio_key, content, file.content_type or "application/octet-stream")
+    except Exception as e:
+        logger.warning(f"MinIO 上传失败（不影响索引）: {e}")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(content)
@@ -89,7 +99,7 @@ async def delete_document(doc_name: str):
     try:
         milvus_client.delete(
             collection_name=COLLECTION_NAME,
-            filter=f'doc_id == "{doc_name}"',
+            filter=f'doc_id == "{doc_id}"',
         )
         return {"message": f"文档 '{doc_name}' 已删除"}
     except Exception as e:
@@ -104,11 +114,11 @@ async def list_documents():
         results = milvus_client.query(
             collection_name=COLLECTION_NAME,
             filter="chunk_index == 0",
-            output_fields=["doc_name", "doc_type", "category"],
+            output_fields=["doc_id", "doc_name", "doc_type", "category"],
             limit=500,
         )
         docs = [
-            {"doc_name": r["doc_name"], "doc_type": r["doc_type"], "category": r["category"]}
+            {"doc_id": r.get("doc_id", ""), "doc_name": r["doc_name"], "doc_type": r["doc_type"], "category": r["category"]}
             for r in results
         ]
         return {"documents": docs, "total": len(docs)}

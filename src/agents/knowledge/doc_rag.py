@@ -13,6 +13,7 @@
 from __future__ import annotations
 from loguru import logger
 from langchain_core.messages import SystemMessage
+from src.agents.llm_utils import ainvoke_with_timeout
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 from pymilvus import MilvusClient
@@ -103,5 +104,5 @@ async def search_docs(
 
     context = format_doc_context(hits)
     prompt = DOC_QA_PROMPT.format(question=question, context=context, role=role)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content

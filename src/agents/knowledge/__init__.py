@@ -30,6 +30,8 @@ from .audit import QueryAuditLog, Timer
 from .feedback import save_feedback, get_feedback_stats
 from .notification import notify_doc_update, get_unread_notifications, mark_notifications_read
 from .conversation import load_conversation_context, save_conversation_context, append_turn, format_context
+from .mineru_client import parse_document, check_mineru_health
+from .tools import KnowledgeDeps, build_knowledge_tools
 from .doc_ingestion import ingest_file, ingest_drug_instructions, ensure_knowledge_collection
 
 __all__ = [
@@ -49,5 +51,7 @@ __all__ = [
     "save_feedback", "get_feedback_stats",
     "notify_doc_update", "get_unread_notifications", "mark_notifications_read",
     "load_conversation_context", "save_conversation_context", "append_turn", "format_context",
-    "ingest_file", "ingest_drug_instructions", "ensure_knowledge_collection",
+    "parse_document", "check_mineru_health",
+    "KnowledgeDeps", "build_knowledge_tools",
+    "ingest_file", "ingest_drug_instructions", "ingest_diseases", "ensure_knowledge_collection",
 ]

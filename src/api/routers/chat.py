@@ -1,4 +1,4 @@
-﻿# src/api/routers/chat.py
+# src/api/routers/chat.py
 
 from __future__ import annotations
 import json
@@ -16,6 +16,7 @@ from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.inquiry.graph import run_inquiry, build_inquiry_deps
 from src.agents.inquiry.state import InquiryState, InquiryPhase
 from src.agents.workers.inquiry_agent import handle_handoff
+from src.agents.workers.knowledge_agent import get_knowledge_agent
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
@@ -45,6 +46,30 @@ SAFE_INQUIRY_FALLBACK = (
     "以及是否伴随发热、疼痛、呕吐、胸闷或呼吸困难等情况。"
 )
 
+
+
+INQUIRY_HINTS = (
+    "\u5934\u75bc", "\u5934\u75db", "\u53d1\u70e7", "\u53d1\u70ed", "\u54b3\u55fd",
+    "\u80f8\u95f7", "\u80f8\u75db", "\u547c\u5438\u56f0\u96be", "\u809a\u5b50\u75bc",
+    "\u8179\u75db", "\u4e0d\u8212\u670d", "\u96be\u53d7", "\u6076\u5fc3", "\u5455\u5410",
+    "\u8179\u6cfb", "\u6302\u4ec0\u4e48\u79d1", "\u5e94\u8be5\u6302", "\u770b\u4ec0\u4e48\u79d1",
+    "\u5c31\u8bca",
+)
+
+KNOWLEDGE_HINTS = (
+    "\u662f\u4ec0\u4e48", "\u6709\u54ea\u4e9b", "\u7c7b\u578b", "\u539f\u56e0",
+    "\u600e\u4e48\u6cbb\u7597", "\u6cbb\u7597", "\u80fd\u6cbb\u597d\u5417",
+    "\u6ce8\u610f\u4ec0\u4e48", "\u65e9\u671f\u75c7\u72b6", "\u5e76\u53d1\u75c7",
+    "\u533a\u522b", "\u8bca\u65ad\u6807\u51c6", "\u9884\u9632",
+)
+
+
+def _looks_like_inquiry(message: str) -> bool:
+    return any(hint in message for hint in INQUIRY_HINTS)
+
+
+def _looks_like_knowledge(message: str) -> bool:
+    return any(hint in message for hint in KNOWLEDGE_HINTS)
 
 def _content_to_text(content) -> str:
     """Normalize LangChain message content to displayable plain text."""
@@ -214,6 +239,22 @@ async def chat(
             return ChatResponse(reply=reply, session_id=req.session_id)
 
         # ── 无活跃问诊：走 Supervisor ──
+        # Fast path for common chat types; avoids an extra Supervisor LLM turn.
+        # 知识问答优先判断（"糖尿病有哪些症状"应走知识库，而非问诊）
+        if _looks_like_knowledge(req.message):
+            knowledge_agent = await get_knowledge_agent()
+            reply = await knowledge_agent.query(
+                req.message,
+                user_id=req.user_id,
+                session_id=req.session_id,
+                db_session=db,
+            )
+            return ChatResponse(reply=reply, session_id=req.session_id)
+
+        if _looks_like_inquiry(req.message):
+            reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
+            return ChatResponse(reply=reply, session_id=req.session_id)
+
         agent = await get_supervisor_agent()
         config = {"configurable": {"thread_id": thread_id}}
 
@@ -261,21 +302,39 @@ async def chat_stream(
                 yield f"data: {data}\n\n"
 
             else:
-                # ── 无活跃问诊：Supervisor 先收敛到最终回复，再推送 ──
-                # 防止 SummaryMiddleware / ToolMessage 等内部片段被 SSE 逐字流到前端。
-                agent = await get_supervisor_agent()
-                config = {"configurable": {"thread_id": thread_id}}
-                result = await agent.ainvoke(
-                    {"messages": [{"role": "user", "content": req.message}]},
-                    config=config,
-                    context=UserContext(user_id=req.user_id, session_id=req.session_id),
-                )
-                reply = extract_agent_reply(result)
-                data = json.dumps(
-                    {"type": "token", "content": reply},
-                    ensure_ascii=False,
-                )
-                yield f"data: {data}\n\n"
+                # 知识问答优先判断（"糖尿病有哪些症状"应走知识库，而非问诊）
+                if _looks_like_knowledge(req.message):
+                    knowledge_agent = await get_knowledge_agent()
+                    reply = await knowledge_agent.query(
+                        req.message,
+                        user_id=req.user_id,
+                        session_id=req.session_id,
+                        db_session=db,
+                    )
+                    data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+
+                elif _looks_like_inquiry(req.message):
+                    reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
+                    data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
+                    yield f"data: {data}\n\n"
+
+                else:
+                    # Supervisor fallback: wait for the final answer before sending it.
+                    # This keeps internal summary/tool messages out of the SSE stream.
+                    agent = await get_supervisor_agent()
+                    config = {"configurable": {"thread_id": thread_id}}
+                    result = await agent.ainvoke(
+                        {"messages": [{"role": "user", "content": req.message}]},
+                        config=config,
+                        context=UserContext(user_id=req.user_id, session_id=req.session_id),
+                    )
+                    reply = extract_agent_reply(result)
+                    data = json.dumps(
+                        {"type": "token", "content": reply},
+                        ensure_ascii=False,
+                    )
+                    yield f"data: {data}\n\n"
 
             done_data = json.dumps(
                 {"type": "done", "session_id": req.session_id}, ensure_ascii=False

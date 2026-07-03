@@ -11,6 +11,7 @@ HyDE（Hypothetical Document Embeddings）模块。
 from __future__ import annotations
 from loguru import logger
 from langchain_core.messages import SystemMessage
+from src.agents.llm_utils import ainvoke_with_timeout
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 
@@ -31,7 +32,7 @@ async def generate_hyde_embedding(
     """
     prompt = HYDE_PROMPT.format(question=question)
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
+        response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
         hypothetical_doc = response.content.strip()
         logger.debug(f"HyDE 假设文档: {hypothetical_doc[:100]}...")
         return await embedding_model.aembed_query(hypothetical_doc)     # 返回假设回答的向量

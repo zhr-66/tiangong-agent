@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from loguru import logger
 from langchain_core.messages import SystemMessage
+from src.agents.llm_utils import ainvoke_with_timeout
 from langchain_core.language_models import BaseChatModel
 from neo4j import AsyncDriver
 
@@ -27,7 +28,7 @@ MAX_CYPHER_RETRIES = 2  #表示 Cypher 执行失败后最多重试 2 次 ，但�
 # 实体提取
 async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
     prompt = ENTITY_EXTRACT_PROMPT.format(question=question)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     try:
         content = response.content.strip()
         if "```" in content:
@@ -48,7 +49,7 @@ async def _generate_cypher(
         question=question,
         entities=json.dumps(entities, ensure_ascii=False),
     ) + extra
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     cypher = response.content.strip()
     if "```" in cypher:
         cypher = cypher.split("```")[1].lstrip("cypher").strip()
@@ -102,5 +103,5 @@ async def search_graph(
     prompt = GRAPH_QA_PROMPT.format(            #根据知识图谱查询结果回答用户问题
         question=question, graph_result=graph_result, role=role,
     )
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content
