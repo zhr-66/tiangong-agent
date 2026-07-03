@@ -77,7 +77,7 @@ class KnowledgeAgent:
             return result
         except Exception as e:
             logger.warning(f"Knowledge route failed: {e}")
-            return {"route": "doc_rag", "reason": "route failed, fallback to doc_rag"}
+            return {"route": "multi", "reason": "route failed, fallback to multi"}
 
     async def _get_db_session(self):
         from src.infra.database import get_db
