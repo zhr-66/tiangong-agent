@@ -37,9 +37,12 @@ async def multi_channel_search(
     db_session: AsyncSession | None = None,
     channels: list[str] | None = None,
     role: str = "patient",
+    context_text: str = "",
 ) -> str:
     """
     多通道并行检索 → 结果融合 → 幻觉检测 → 返回最终回答。
+    question: 用于检索的问题（改写后的问题）
+    context_text: 用于最终 LLM 生成回答的问题（含多轮对话上下文）
     channels: 指定使用哪些通道 ["doc_rag", "graph_rag", "nl2sql"]，默认 doc_rag + graph_rag
     """
     if channels is None:
@@ -93,8 +96,9 @@ async def multi_channel_search(
         return "所有检索通道均未找到与您问题相关的信息。"
 
     sources = "\n\n".join(source_parts)
+    answer_question = context_text if context_text else question
     prompt = FUSION_PROMPT.format(
-        question=question, sources=sources, role=role,
+        question=answer_question, sources=sources, role=role,
     )
     response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     answer = response.content

@@ -97,22 +97,22 @@ class KnowledgeAgent:
             self._docs_collection_available = False
         return self._docs_collection_available
 
-    async def _search_docs_with_graph_fallback(self, question: str, role: str) -> tuple[str, list[str]]:
+    async def _search_docs_with_graph_fallback(self, question: str, role: str, context_text: str = "") -> tuple[str, list[str]]:
         if not self._has_docs_collection():
             logger.info("Knowledge docs collection is unavailable; using GraphRAG directly")
             neo4j_driver = await self._get_neo4j_driver()
-            return await search_graph(question, neo4j_driver, self.llm, role), ["graph_rag"]
+            return await search_graph(question, neo4j_driver, self.llm, role, context_text=context_text), ["graph_rag"]
 
         answer = await search_docs(
             question, self.embedding_model, self.milvus_client,
-            self.llm, role=role, use_hyde=True,
+            self.llm, role=role, use_hyde=True, context_text=context_text,
         )
         channels = ["doc_rag"]
 
         if _looks_like_no_context_answer(answer):
             logger.info("DocRAG returned no context; fallback to GraphRAG")
             neo4j_driver = await self._get_neo4j_driver()
-            graph_answer = await search_graph(question, neo4j_driver, self.llm, role)
+            graph_answer = await search_graph(question, neo4j_driver, self.llm, role, context_text=context_text)
             if not _looks_like_no_context_answer(graph_answer):
                 return graph_answer, ["doc_rag", "graph_rag"]
 
@@ -135,42 +135,46 @@ class KnowledgeAgent:
             history = await load_conversation_context(redis_client, user_id, session_id)
             context_text = format_context(history)
 
-            # 有历史上下文时，增强问题以便 LLM 理解指代关系
+            # 有历史上下文时，用上下文增强问题做改写（让 LLM 解析指代："这两种药"→具体药名）
             if context_text:
-                enriched_question = f"{context_text}\n\n当前问题：{question}"
+                rewrite_input = f"{context_text}\n\n当前问题：{question}"
             else:
-                enriched_question = question
+                rewrite_input = question
 
-            rewrite_result, route_result = await asyncio.gather(
-                rewrite_query(enriched_question, self.llm, role),
-                self._route_query(enriched_question),
-            )
+            # 改写：解析指代、补全省略，输出具体可检索的问题
+            rewrite_result = await rewrite_query(rewrite_input, self.llm, role)
+            rewritten = rewrite_result.get("queries", [question])[0]
             intent = rewrite_result.get("intent", "knowledge_qa")
+
+            # 路由用改写后的问题（"维C银翘片和氨氯地平能一起吃吗"→prescription）
+            route_result = await self._route_query(rewritten)
             route = route_result.get("route", "doc_rag")
-            route = route_result.get("route", "doc_rag")
+
+            # 最终 LLM 生成回答时用含上下文的问题
+            answer_question = rewrite_input if context_text else question
 
             logger.info(
-                "Knowledge query | question={} | route={} | intent={}",
-                question[:60], route, intent,
+                "Knowledge query | question={} | rewritten={} | route={} | intent={}",
+                question[:60], rewritten[:60], route, intent,
             )
 
             if route == "prescription":
                 neo4j_driver = await self._get_neo4j_driver()
                 answer = await review_prescription(
-                    enriched_question, self.llm, self.embedding_model,
+                    answer_question, self.llm, self.embedding_model,
                     self.milvus_client, neo4j_driver,
                 )
                 channels = ["prescription"]
 
             elif route == "graph_rag":
                 neo4j_driver = await self._get_neo4j_driver()
-                answer = await search_graph(enriched_question, neo4j_driver, self.llm, role)
+                answer = await search_graph(rewritten, neo4j_driver, self.llm, role, context_text=answer_question)
                 channels = ["graph_rag"]
 
             elif route == "nl2sql":
                 if db_session is None:
                     db_session = await self._get_db_session()
-                answer = await search_sql(enriched_question, self.llm, db_session)
+                answer = await search_sql(rewritten, self.llm, db_session)
                 channels = ["nl2sql"]
 
             elif route == "multi":
@@ -178,15 +182,16 @@ class KnowledgeAgent:
                 if db_session is None:
                     db_session = await self._get_db_session()
                 answer = await multi_channel_search(    # 多通道检索
-                    enriched_question, self.llm, self.embedding_model,
+                    rewritten, self.llm, self.embedding_model,
                     self.milvus_client, neo4j_driver, db_session,
                     channels=["doc_rag", "graph_rag"],
                     role=role,
+                    context_text=answer_question,
                 )
                 channels = ["doc_rag", "graph_rag"]
 
             else:
-                answer, channels = await self._search_docs_with_graph_fallback(enriched_question, role)
+                answer, channels = await self._search_docs_with_graph_fallback(rewritten, role, context_text=answer_question)
 
             # 保存本轮对话到上下文
             if user_id and session_id:

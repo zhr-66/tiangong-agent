@@ -97,6 +97,9 @@ NL2CYPHER_PROMPT = """你是 Neo4j Cypher 查询专家。根据用户问题和�
 2. 查询深度最多 3 跳
 3. 返回结果用 LIMIT 限制，最多 20 条
 4. 返回有意义的字段（name、属性），不要只返回节点 ID
+5. **疾病名用模糊匹配**：用 `WHERE d.name CONTAINS '关键词'` 而非精确匹配，因为用户口语和图谱节点名可能不完全一致（如"感冒了"→CONTAINS '感冒'，"高血压"→CONTAINS '高血压'）
+6. 查询药物的常用模式：`MATCH (d:Disease) WHERE d.name CONTAINS '感冒' MATCH (d)-[:COMMON_DRUG|RECOMMEND_DRUG]->(drug:Drug) RETURN drug.name`
+7. 提取的实体名可能和图谱节点名不完全匹配，必须用 CONTAINS 模糊查询
 
 用户问题：{question}
 已提取的实体：{entities}

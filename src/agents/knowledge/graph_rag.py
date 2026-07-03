@@ -93,15 +93,22 @@ async def search_graph(
     neo4j_driver: AsyncDriver,
     llm: BaseChatModel,
     role: str = "patient",
+    context_text: str = "",
 ) -> str:
+    """GraphRAG 检索 + LLM 生成回答。
+    question: 用于实体提取和 Cypher 查询的问题（改写后的问题）
+    context_text: 用于最终 LLM 生成回答时的问题（含多轮对话上下文）
+    """
     records = await search_graph_raw(question, neo4j_driver, llm)
 
     if not records:
         return "知识图谱中未找到与您问题相关的信息。"
 
+    # 最终生成回答时用含上下文的问题，让 LLM 理解指代
+    answer_question = context_text if context_text else question
     graph_result = json.dumps(records, ensure_ascii=False, indent=2)
-    prompt = GRAPH_QA_PROMPT.format(            #根据知识图谱查询结果回答用户问题
-        question=question, graph_result=graph_result, role=role,
+    prompt = GRAPH_QA_PROMPT.format(
+        question=answer_question, graph_result=graph_result, role=role,
     )
     response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content

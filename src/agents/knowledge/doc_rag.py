@@ -92,8 +92,12 @@ async def search_docs(
     doc_type: str | None = None,
     role: str = "patient",
     use_hyde: bool = True,
+    context_text: str = "",
 ) -> str:
-    """HyDE 增强 + 文档 RAG 检索 + Reranker 精排 + 生成回答。"""
+    """HyDE 增强 + 文档 RAG 检索 + Reranker 精排 + 生成回答。
+    question: 用于检索的问题（改写后的问题）
+    context_text: 用于最终 LLM 生成回答的问题（含多轮对话上下文）
+    """
     hits = await search_docs_raw(
         question, embedding_model, milvus_client,
         top_k=top_k, rerank_top_k=rerank_top_k, doc_type=doc_type,
@@ -103,6 +107,7 @@ async def search_docs(
         return "当前知识库中未找到与您问题相关的文档内容。"
 
     context = format_doc_context(hits)
-    prompt = DOC_QA_PROMPT.format(question=question, context=context, role=role)
+    answer_question = context_text if context_text else question
+    prompt = DOC_QA_PROMPT.format(question=answer_question, context=context, role=role)
     response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content
