@@ -35,14 +35,14 @@ async def hybrid_search(
         reqs=[dense_req, sparse_req],
         ranker=RRFRanker(k=60),
         limit=top_k,
-        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index", "parent_text"],
+        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index"],
     )
 
     hits = []
     for hit in results[0]:
         hits.append({
             "text": hit["entity"]["text"],
-            "parent_text": hit["entity"].get("parent_text", ""),
+            "parent_text": "",
             "doc_name": hit["entity"]["doc_name"],
             "doc_type": hit["entity"]["doc_type"],
             "score": hit["distance"],
