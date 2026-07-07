@@ -20,14 +20,17 @@ def get_trulens_session() -> TruSession:
 def get_llm_provider() -> LiteLLM:
     """
     评估用 LLM Provider（LLM-as-Judge）。
-    注意：参数名是 model_engine，不是 model_name。
-    前缀 openai/ 表示走 OpenAI 兼容协议。
+    通过 LiteLLM 对接 DashScope OpenAI 兼容接口（qwen-plus）。
+
+    说明：TruLens feedback 函数默认使用 response_format 参数要求结构化输出，
+    DeepSeek API 不支持该参数类型（返回 "This response_format type is unavailable now"），
+    而 DashScope 的 OpenAI 兼容接口支持 response_format，因此评估用 LLM 改用 qwen-plus。
     """
     return LiteLLM(
-        model_engine=f"openai/{settings.CHAT_MODEL}",
+        model_engine="openai/qwen-plus",
         completion_kwargs={
             "api_key": settings.DASHSCOPE_API_KEY,
-            "api_base": settings.BASE_URL_CHAT,
+            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         },
     )
 

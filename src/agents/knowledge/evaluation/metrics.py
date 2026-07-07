@@ -49,8 +49,7 @@ def build_medical_metrics(provider: LiteLLM) -> list[Metric]:
         implementation=provider.harmfulness_with_cot_reasons,
         name="安全性",
         selectors={
-            "prompt": Selector.select_record_input(),
-            "response": Selector.select_record_output(),
+            "text": Selector.select_record_output(),
         },
     )
 
