@@ -89,16 +89,35 @@ async def _insert_texts(
 
 
 async def download_cmirb(milvus_client, embedding_model):
-    from datasets import load_dataset
+    """
+    下载 CMIRB/MedicalRetrieval 数据集。
 
-    print("[INFO] 下载 CMIRB/MedicalRetrieval 数据集...")
-    ds = load_dataset("CMIRB/MedicalRetrieval", "corpus", split="corpus")
+    说明：Python 3.13 + 旧版 datasets 2.13.0 + 新版 pyarrow 19 不兼容
+    （PyExtensionType 已移除），因此绕过 datasets 库，直接下载 corpus.jsonl
+    并本地解析。
+
+    数据来源：https://huggingface.co/datasets/CMIRB/MedicalRetrieval
+    """
+    import json
+    from huggingface_hub import hf_hub_download
+
+    print("[INFO] 下载 CMIRB/MedicalRetrieval 数据集（直接拉取 corpus.jsonl）...")
+    corpus_path = hf_hub_download(
+        repo_id="CMIRB/MedicalRetrieval",
+        filename="corpus.jsonl",
+        repo_type="dataset",
+    )
 
     texts = []
-    for row in ds:
-        text = row.get("text", "") or row.get("content", "")
-        if text and len(text.strip()) > 20:
-            texts.append(text.strip()[:2000])
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            text = row.get("text", "") or row.get("content", "")
+            if text and len(text.strip()) > 20:
+                texts.append(text.strip()[:2000])
 
     print(f"[INFO] CMIRB 共 {len(texts)} 条有效文本，开始向量化...")
 
@@ -122,19 +141,51 @@ async def download_cmirb(milvus_client, embedding_model):
 
 
 async def download_med_dialogue(milvus_client, embedding_model):
-    from datasets import load_dataset
+    """
+    下载 Chinese-medical-dialogue-data 数据集。
 
-    print("[INFO] 下载 Chinese-medical-dialogue-data 数据集...")
-    ds = load_dataset("BillGPT/Chinese-medical-dialogue-data")
+    说明：Python 3.13 + 旧版 datasets 2.13.0 + 新版 pyarrow 19 不兼容
+    （PyExtensionType 已移除），因此绕过 datasets 库，直接下载 外科.zip
+    并本地解析 CSV 文件。
+
+    数据来源：https://huggingface.co/datasets/BillGPT/Chinese-medical-dialogue-data
+    """
+    import csv
+    import zipfile
+    from huggingface_hub import hf_hub_download
+
+    print("[INFO] 下载 Chinese-medical-dialogue-data 数据集（直接拉取 外科.zip）...")
+    zip_path = hf_hub_download(
+        repo_id="BillGPT/Chinese-medical-dialogue-data",
+        filename="外科.zip",
+        repo_type="dataset",
+    )
 
     texts = []
-    for split_name in ds:
-        for row in ds[split_name]:
-            q = row.get("ask", "") or row.get("question", "") or ""
-            a = row.get("answer", "") or ""
-            if q and a and len(q) > 5 and len(a) > 10:
-                text = f"问：{q.strip()}\n答：{a.strip()}"
-                texts.append(text[:2000])
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in zf.namelist():
+            if not name.lower().endswith(".csv"):
+                continue
+            with zf.open(name) as f:
+                # 尝试多种编码，中文 CSV 常见 GBK/UTF-8
+                content = f.read()
+                for enc in ("utf-8", "gbk", "gb18030"):
+                    try:
+                        text_content = content.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    print(f"  [WARN] 无法解码 {name}，跳过")
+                    continue
+
+                reader = csv.DictReader(text_content.splitlines())
+                for row in reader:
+                    q = (row.get("ask") or row.get("question") or "").strip()
+                    a = (row.get("answer") or "").strip()
+                    if q and a and len(q) > 5 and len(a) > 10:
+                        text = f"问：{q}\n答：{a}"
+                        texts.append(text[:2000])
 
     print(f"[INFO] 医患对话共 {len(texts)} 条有效记录，开始向量化...")
 
@@ -158,28 +209,104 @@ async def download_med_dialogue(milvus_client, embedding_model):
 
 
 async def download_medqa():
-    from datasets import load_dataset
-    import json
+    """
+    下载 MedQA 中文 4 选项数据集。
 
-    print("[INFO] 下载 MedQA 数据集...")
-    ds = load_dataset("bigbio/med_qa", "med_qa_zh_4options_bigbio_qa")
+    说明：bigbio/med_qa 是脚本式数据集（med_qa.py），新版 datasets 库
+    (>=2.14) 已不再支持执行 dataset scripts，且与新版 pyarrow (>=15) 存在
+    PyExtensionType 兼容性问题。因此这里绕过 datasets 库，直接通过
+    huggingface_hub 下载 data_clean.zip 并本地解析 JSONL 文件。
+
+    数据来源：https://huggingface.co/datasets/bigbio/med_qa
+    原始项目：https://github.com/jind11/MedQA
+    """
+    import json
+    import zipfile
+    import tempfile
+    import requests
+
+    print("[INFO] 下载 MedQA 数据集（直接拉取 data_clean.zip）...")
+
+    # 直接通过镜像 URL 下载，绕过 huggingface_hub 元数据校验
+    # 优先 hf-mirror.com（国内加速），失败则回退官方源
+    mirror_urls = [
+        "https://hf-mirror.com/datasets/bigbio/med_qa/resolve/main/data_clean.zip",
+        "https://huggingface.co/datasets/bigbio/med_qa/resolve/main/data_clean.zip",
+    ]
+
+    tmp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(tmp_dir, "data_clean.zip")
+
+    downloaded = False
+    for url in mirror_urls:
+        try:
+            print(f"  [尝试] {url}")
+            with requests.get(url, stream=True, timeout=30, verify=True) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                print(f"  [连接成功] 文件大小：{total / 1024 / 1024:.1f} MB")
+                with open(zip_path, "wb") as f:
+                    downloaded_bytes = 0
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        pct = (downloaded_bytes / total * 100) if total else 0
+                        print(f"\r  [下载中] {pct:5.1f}% ({downloaded_bytes // 1024}KB)", end="", flush=True)
+            print(f"\n  [OK] 下载完成")
+            downloaded = True
+            break
+        except Exception as e:
+            print(f"  [失败] {e}")
+            continue
+
+    if not downloaded:
+        raise RuntimeError("所有镜像源下载失败，请检查网络连接或配置代理。")
+
+    # 中文 4 选项子集在 zip 内的相对路径
+    split_files = {
+        "train": "data_clean/questions/Mainland/4_options/train.jsonl",
+        "test": "data_clean/questions/Mainland/4_options/test.jsonl",
+        "validation": "data_clean/questions/Mainland/4_options/dev.jsonl",
+    }
 
     eval_dir = os.path.join(os.path.dirname(__file__), "..", "data", "eval")
     os.makedirs(eval_dir, exist_ok=True)
 
     records = []
-    for split_name in ds:
-        for row in ds[split_name]:
-            question = row.get("question", "")
-            choices = row.get("choices", [])
-            answer = row.get("answer", [])
-            if question:
-                records.append({
-                    "question": question,
-                    "choices": choices,
-                    "answer": answer,
-                    "split": split_name,
-                })
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # 校验文件存在
+        names = set(zf.namelist())
+        for split, rel in split_files.items():
+            # zip 内路径分隔符可能为反斜杠，统一兼容
+            rel_norm = rel.replace("/", os.sep)
+            matched = rel if rel in names else (rel_norm if rel_norm in names else None)
+            if matched is None:
+                print(f"[WARN] zip 内未找到 {rel}，跳过 {split}")
+                continue
+
+            with zf.open(matched) as f:
+                lines = f.read().decode("utf-8").splitlines()
+
+            count = 0
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                question = row.get("question", "")
+                options = row.get("options", {})
+                answer = row.get("answer", "")
+                # 转为 bigbio_qa schema：choices 为选项值列表，answer 为列表
+                choices = list(options.values()) if isinstance(options, dict) else list(options)
+                if question:
+                    records.append({
+                        "question": question,
+                        "choices": choices,
+                        "answer": [answer] if answer else [],
+                        "split": split,
+                    })
+                    count += 1
+            print(f"  [进度] {split}: {count} 条")
 
     output_path = os.path.join(eval_dir, "medqa_zh.json")
     with open(output_path, "w", encoding="utf-8") as f:
