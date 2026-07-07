@@ -121,12 +121,14 @@ async def run_query(
     """
     error_hint = ""
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(MAX_RETRIES + 1):   # 最多重试 2 次
+         # 1️⃣ LLM 生成 SQL（带多轮对话上下文）
         raw_sql = await generate_sql(
             question, llm, role, department_id, context, error_hint,
         )
         logger.info(f"NL2SQL (attempt {attempt + 1}): {raw_sql}")
 
+        # 2️⃣ 安全校验
         valid, validated = validate_sql(raw_sql)
         if not valid:
             result = QueryResult(
@@ -137,10 +139,13 @@ async def run_query(
                 context.add(result)
             return result
 
+        # 3️⃣ 角色权限过滤
         validated = apply_role_filter(validated, role, department_id)
 
+        # 4️⃣ 执行 SQL（10秒超时）
         try:
             data, columns = await execute_sql(validated, db)
+            # 5️⃣ LLM 生成摘要
             summary = await generate_summary(question, data, llm)
 
             result = QueryResult(
@@ -162,7 +167,7 @@ async def run_query(
             return result
 
         except Exception as e:
-            error_hint = str(e)
+            error_hint = str(e)     # 把错误信息反馈给 LLM，让它修正
             logger.warning(f"SQL 执行失败 (attempt {attempt + 1}): {e}")
             if attempt == MAX_RETRIES:
                 result = QueryResult(
