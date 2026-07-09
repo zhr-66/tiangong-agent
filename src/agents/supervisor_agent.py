@@ -132,10 +132,10 @@ async def create_supervisor_agent():
                 model=settings.DEEPSEEK_MODEL,
                 trigger=[
                     ("tokens", 4000),  # token数达到4k时触发
-                    ("messages", 6),  # 或消息数达到 6 条时触发
+                    ("messages", 10),  # 或消息数达到 10 条时触发
                     # ("fraction", 0.8)  # 或80%消息时触发
                 ],
-                keep=("messages", 6),  # 摘要后保留最近 6 条消息
+                keep=("messages", 4),  # 摘要后保留最近 4 条消息，与 trigger 拉开差距避免每轮触发
             )
         ],
         checkpointer=checkpointer, # 短期记忆. agent chat ui（禁用你配置 checkpointer）
