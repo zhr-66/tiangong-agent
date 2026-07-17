@@ -20,7 +20,7 @@ import asyncio
 import json
 from loguru import logger
 from langchain_core.messages import SystemMessage
-from src.agents.llm_utils import ainvoke_with_timeout
+from src.agents.llm_utils import agenerate_final, ainvoke_with_timeout
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 from neo4j import AsyncDriver
@@ -267,7 +267,9 @@ async def multi_channel_search(
     prompt = FUSION_PROMPT.format(
         question=answer_question, sources=sources, role=role,
     )
-    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
+    # 最终面向用户的生成：流式接口下逐 token 推送
+    # （之后的幻觉检测只会在末尾追加警告，不修改正文，由路由层 replace 事件对账）
+    response = await agenerate_final(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     answer = response.content
 
     # ---------- 幻觉检测 ----------

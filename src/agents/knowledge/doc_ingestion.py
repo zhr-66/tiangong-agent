@@ -9,6 +9,7 @@
 """
 
 from __future__ import annotations
+import asyncio
 import os
 import hashlib
 from loguru import logger
@@ -160,11 +161,13 @@ async def ingest_file(
     embedding_model: Embeddings,
     milvus_client: MilvusClient,
 ) -> int:
-    ensure_knowledge_collection(milvus_client)
-    
+    # pymilvus 是同步客户端，统一放线程池执行，避免阻塞事件循环
+    await asyncio.to_thread(ensure_knowledge_collection, milvus_client)
+
     doc_id = hashlib.md5(doc_name.encode()).hexdigest()[:16]
-    
-    milvus_client.delete(
+
+    await asyncio.to_thread(
+        milvus_client.delete,
         collection_name=COLLECTION_NAME,
         filter=f'doc_id == "{doc_id}"',
     )
@@ -195,7 +198,8 @@ async def ingest_file(
     
     if all_data:
         for i in range(0, len(all_data), 1000):
-            milvus_client.insert(
+            await asyncio.to_thread(
+                milvus_client.insert,
                 collection_name=COLLECTION_NAME,
                 data=all_data[i:i + 1000],
             )
@@ -248,11 +252,12 @@ async def ingest_drug_instructions(
         doc_name = f"{name}_说明书.txt"
         doc_id = hashlib.md5(f"drug_{drug_id}".encode()).hexdigest()[:16]
         
-        milvus_client.delete(
+        await asyncio.to_thread(
+            milvus_client.delete,
             collection_name=COLLECTION_NAME,
             filter=f'doc_id == "{doc_id}"',
         )
-        
+
         chunks = _chunk_text(content)
         all_data = []
         for i, text in enumerate(chunks):
@@ -271,7 +276,8 @@ async def ingest_drug_instructions(
             all_data.append(data_item)
         
         if all_data:
-            milvus_client.insert(
+            await asyncio.to_thread(
+                milvus_client.insert,
                 collection_name=COLLECTION_NAME,
                 data=all_data,
             )
@@ -343,12 +349,16 @@ async def ingest_diseases(
 
         # 批量写入
         if len(all_data) >= batch_size:
-            milvus_client.insert(collection_name=COLLECTION_NAME, data=all_data)
+            await asyncio.to_thread(
+                milvus_client.insert, collection_name=COLLECTION_NAME, data=all_data
+            )
             logger.info(f"已导入 {total} 个分块...")
             all_data = []
 
     if all_data:
-        milvus_client.insert(collection_name=COLLECTION_NAME, data=all_data)
+        await asyncio.to_thread(
+            milvus_client.insert, collection_name=COLLECTION_NAME, data=all_data
+        )
 
     logger.info(f"疾病知识导入完成，共 {total} 个分块")
     return total

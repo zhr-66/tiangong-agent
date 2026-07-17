@@ -11,9 +11,11 @@
 """
 
 from __future__ import annotations
+import asyncio
+
 from loguru import logger
 from langchain_core.messages import SystemMessage
-from src.agents.llm_utils import ainvoke_with_timeout
+from src.agents.llm_utils import agenerate_final
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 from pymilvus import MilvusClient
@@ -43,8 +45,9 @@ async def search_docs_raw(
     filter_expr = f'doc_type == "{doc_type}"' if doc_type else None
 
     try:
-        # 向量初召回
-        results = milvus_client.search(
+        # 向量初召回（pymilvus 是同步客户端，放线程池避免阻塞事件循环）
+        results = await asyncio.to_thread(
+            milvus_client.search,
             collection_name=COLLECTION_NAME,
             data=[query_vec],
             limit=top_k,
@@ -109,5 +112,6 @@ async def search_docs(
     context = format_doc_context(hits)
     answer_question = context_text if context_text else question
     prompt = DOC_QA_PROMPT.format(question=answer_question, context=context, role=role)
-    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
+    # 最终面向用户的生成：流式接口下逐 token 推送
+    response = await agenerate_final(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content

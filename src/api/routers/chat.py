@@ -1,8 +1,10 @@
 # src/api/routers/chat.py
 
 from __future__ import annotations
+import asyncio
 import json
 import traceback
+from typing import Awaitable, Callable
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage
@@ -12,6 +14,7 @@ from loguru import logger
 
 from src.infra.database import get_db
 from src.infra.redis_cache import get_checkpointer_redis
+from src.agents.llm_utils import reset_token_sink, set_token_sink
 from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.inquiry.graph import run_inquiry, build_inquiry_deps
 from src.agents.inquiry.state import InquiryState, InquiryPhase
@@ -274,6 +277,52 @@ async def chat(
 
 
 # ── 流式接口（SSE） ───────────────────────────────────────────────────────
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_pipeline_events(
+    pipeline: Callable[[], Awaitable[str]],
+    session_id: str,
+):
+    """
+    把回答管线包装成 SSE 事件流（真流式）。
+
+    机制：注册 token sink（contextvar，自动传播到管线内部的 LangGraph 节点/工具），
+    管线中"面向用户的最终生成"（agenerate_final 调用点）逐 token 实时推送；
+    管线结束后推一条 replace 事件对账——权威回复可能与已推 token 存在差异
+    （幻觉检测追加的警告、DocRAG 回退 GraphRAG、挂号移交拼接等生成后修正），
+    客户端以 replace 内容为准整体替换。
+    """
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def sink(token: str) -> None:
+        await queue.put(token)
+
+    async def runner() -> str:
+        ctx_token = set_token_sink(sink)
+        try:
+            return await pipeline()
+        finally:
+            reset_token_sink(ctx_token)
+            await queue.put(None)  # 结束哨兵，确保消费循环退出
+
+    task = asyncio.create_task(runner())
+    try:
+        while True:
+            token = await queue.get()
+            if token is None:
+                break
+            yield _sse({"type": "token", "content": token})
+
+        reply = await task  # 管线抛异常时在此重新抛出，由外层统一转 error 事件
+        yield _sse({"type": "replace", "content": reply})
+        yield _sse({"type": "done", "session_id": session_id})
+    finally:
+        if not task.done():
+            task.cancel()  # 客户端断开时终止管线
+
+
 @router.post("/stream")
 async def chat_stream(
     req: ChatRequest,
@@ -281,13 +330,13 @@ async def chat_stream(
 ):
     """
     流式对话接口（Server-Sent Events）。
-    问诊进行中时，InquiryGraph 的回复以流式推送；
-    Supervisor 回复同样以流式推送。
+    各分支的"最终面向用户生成"逐 token 实时推送。
 
     客户端接收格式：
-        data: {"type": "token",  "content": "..."}
-        data: {"type": "done",   "session_id": "..."}
-        data: {"type": "error",  "message": "..."}
+        data: {"type": "token",   "content": "..."}   # 增量 token，追加显示
+        data: {"type": "replace", "content": "..."}   # 权威全文，整体替换已显示内容
+        data: {"type": "done",    "session_id": "..."}
+        data: {"type": "error",   "message": "..."}
     """
     async def event_generator():
         try:
@@ -295,35 +344,31 @@ async def chat_stream(
             thread_id = f"{req.user_id}:{req.session_id}"
             active_key = f"inquiry_active:{thread_id}"
 
-            # ── 问诊进行中：InquiryGraph 非流式执行，结果整体推送 ──
-            # （InquiryGraph 内部多次调用 LLM，流式拆分复杂度高，
-            #   此处以整体推送为主，后续可按节点拆分优化）
+            # 分支选择逻辑与非流式接口一致
             if await redis.exists(active_key):
-                reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
-                data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
+                def pipeline():
+                    return _run_inquiry_turn(req.message, thread_id, redis, db)
 
-            else:
-                # 知识问答优先判断（"糖尿病有哪些症状"应走知识库，而非问诊）
-                if _looks_like_knowledge(req.message):
-                    knowledge_agent = await get_knowledge_agent()
-                    reply = await knowledge_agent.query(
+            elif _looks_like_knowledge(req.message):
+                knowledge_agent = await get_knowledge_agent()
+
+                def pipeline():
+                    return knowledge_agent.query(
                         req.message,
                         user_id=req.user_id,
                         session_id=req.session_id,
                         db_session=db,
                     )
-                    data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
-                    yield f"data: {data}\n\n"
 
-                elif _looks_like_inquiry(req.message):
-                    reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
-                    data = json.dumps({"type": "token", "content": reply}, ensure_ascii=False)
-                    yield f"data: {data}\n\n"
+            elif _looks_like_inquiry(req.message):
+                def pipeline():
+                    return _run_inquiry_turn(req.message, thread_id, redis, db)
 
-                else:
-                    # Supervisor fallback: wait for the final answer before sending it.
-                    # This keeps internal summary/tool messages out of the SSE stream.
+            else:
+                # Supervisor 分支：Supervisor 自身的最终回复不逐 token 推送
+                # （经 extract_agent_reply 清洗后随 replace 事件下发），
+                # 但其调用的知识类工具内部的最终生成仍会实时流出。
+                async def pipeline():
                     agent = await get_supervisor_agent()
                     config = {"configurable": {"thread_id": thread_id}}
                     result = await agent.ainvoke(
@@ -331,22 +376,14 @@ async def chat_stream(
                         config=config,
                         context=UserContext(user_id=req.user_id, session_id=req.session_id),
                     )
-                    reply = extract_agent_reply(result)
-                    data = json.dumps(
-                        {"type": "token", "content": reply},
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {data}\n\n"
+                    return extract_agent_reply(result)
 
-            done_data = json.dumps(
-                {"type": "done", "session_id": req.session_id}, ensure_ascii=False
-            )
-            yield f"data: {done_data}\n\n"
+            async for event in _stream_pipeline_events(pipeline, req.session_id):
+                yield event
 
-        except Exception as e:
-            logger.exception(f"chat/stream 接口异常")
-            error_data = json.dumps({"type": "error", "message": traceback.format_exc()}, ensure_ascii=False)
-            yield f"data: {error_data}\n\n"
+        except Exception:
+            logger.exception("chat/stream 接口异常")
+            yield _sse({"type": "error", "message": traceback.format_exc()})
 
     return StreamingResponse(
         event_generator(),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -154,7 +155,9 @@ async def semantic_match_symptoms(
     still_unmatched: list[str] = []
     for symptom, query_vec in zip(unmatched_symptoms, query_embeddings):
         try:
-            results = milvus_client.search(
+            # pymilvus 是同步客户端，放线程池避免阻塞事件循环
+            results = await asyncio.to_thread(
+                milvus_client.search,
                 collection_name="symptom_index",
                 data=[query_vec],
                 limit=1,

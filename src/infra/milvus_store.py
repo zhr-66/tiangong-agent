@@ -146,9 +146,11 @@ class MilvusStore(BaseStore):
         doc_id = self._make_id(namespace, key)
 
         # value 为 None 表示删除
+        # pymilvus Collection 的 delete/insert/query/search 均为同步阻塞调用，
+        # 统一放线程池执行，避免阻塞事件循环
         if value is None:
             expr = f'id == "{doc_id}"'
-            self._collection.delete(expr)
+            await asyncio.to_thread(self._collection.delete, expr)
             return
 
         # 将 value 序列化为文本用于生成向量
@@ -156,10 +158,10 @@ class MilvusStore(BaseStore):
         embedding = await self._aembed_text(text_for_embed)
 
         # 先删除旧记录（upsert 语义）
-        self._collection.delete(f'id == "{doc_id}"')
+        await asyncio.to_thread(self._collection.delete, f'id == "{doc_id}"')
 
         # 插入新记录
-        self._collection.insert([{
+        await asyncio.to_thread(self._collection.insert, [{
             "id": doc_id,
             "namespace": self._ns_to_str(namespace),
             "key": key,
@@ -167,7 +169,7 @@ class MilvusStore(BaseStore):
             "embedding": embedding,
             "created_at": time.time(),
         }])
-        self._collection.flush()
+        await asyncio.to_thread(self._collection.flush)
 
     async def _aget(
         self,
@@ -176,7 +178,8 @@ class MilvusStore(BaseStore):
     ) -> Item | None:
         """精确查询一条记忆。"""
         doc_id = self._make_id(namespace, key)
-        results = self._collection.query(
+        results = await asyncio.to_thread(
+            self._collection.query,
             expr=f'id == "{doc_id}"',
             output_fields=["id", "namespace", "key", "value_json", "created_at"],
         )
@@ -202,7 +205,8 @@ class MilvusStore(BaseStore):
 
         if not query:
             # 无查询词时按 namespace 前缀列举
-            results = self._collection.query(
+            results = await asyncio.to_thread(
+                self._collection.query,
                 expr=f'namespace like "{ns_filter}%"',
                 output_fields=["id", "namespace", "key", "value_json", "created_at"],
                 limit=limit,
@@ -211,7 +215,8 @@ class MilvusStore(BaseStore):
 
         # 有查询词时做向量相似度检索
         query_vec = await self._aembed_text(query)
-        search_results = self._collection.search(
+        search_results = await asyncio.to_thread(
+            self._collection.search,
             data=[query_vec],
             anns_field="embedding",
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},

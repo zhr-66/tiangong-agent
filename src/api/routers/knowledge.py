@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import os
 import tempfile
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
 
 
 def _get_deps():
+    """同步构造依赖（MilvusClient 构造时会同步建连），调用方需放线程池执行。"""
     embedding_model = DashScopeEmbeddings(
         model=settings.EMBEDDING_MODEL,
         dashscope_api_key=settings.DASHSCOPE_API_KEY,
@@ -48,10 +50,12 @@ async def upload_document(
 
     content = await file.read()
 
-    # 存原始文件到 MinIO
+    # 存原始文件到 MinIO（minio SDK 是同步 HTTP 调用，放线程池避免阻塞事件循环）
     minio_key = f"knowledge/{doc_type}/{file.filename}"
     try:
-        minio_upload(minio_key, content, file.content_type or "application/octet-stream")
+        await asyncio.to_thread(
+            minio_upload, minio_key, content, file.content_type or "application/octet-stream"
+        )
     except Exception as e:
         logger.warning(f"MinIO 上传失败（不影响索引）: {e}")
 
@@ -60,7 +64,7 @@ async def upload_document(
         tmp_path = tmp.name
 
     try:
-        embedding_model, milvus_client = _get_deps()
+        embedding_model, milvus_client = await asyncio.to_thread(_get_deps)
         chunk_count = await ingest_file(
             file_path=tmp_path,
             doc_name=file.filename,
@@ -95,9 +99,10 @@ async def upload_document_with_notify(
 async def delete_document(doc_name: str):
     import hashlib
     doc_id = hashlib.md5(doc_name.encode()).hexdigest()[:16]
-    _, milvus_client = _get_deps()
+    _, milvus_client = await asyncio.to_thread(_get_deps)
     try:
-        milvus_client.delete(
+        await asyncio.to_thread(
+            milvus_client.delete,
             collection_name=COLLECTION_NAME,
             filter=f'doc_id == "{doc_id}"',
         )
@@ -108,10 +113,11 @@ async def delete_document(doc_name: str):
 
 @router.get("/docs")
 async def list_documents():
-    _, milvus_client = _get_deps()
+    _, milvus_client = await asyncio.to_thread(_get_deps)
     try:
-        ensure_knowledge_collection(milvus_client)
-        results = milvus_client.query(
+        await asyncio.to_thread(ensure_knowledge_collection, milvus_client)
+        results = await asyncio.to_thread(
+            milvus_client.query,
             collection_name=COLLECTION_NAME,
             filter="chunk_index == 0",
             output_fields=["doc_id", "doc_name", "doc_type", "category"],

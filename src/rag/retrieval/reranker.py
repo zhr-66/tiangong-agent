@@ -1,3 +1,5 @@
+import asyncio
+
 import dashscope
 from loguru import logger
 from src.core.config import get_settings
@@ -12,7 +14,9 @@ async def rerank(query: str, results: list[dict], top_k: int = 5) -> list[dict]:
 
     documents = [r["text"] for r in results]
     try:
-        response = dashscope.TextReRank.call(
+        # TextReRank.call 是同步 HTTP 调用，直接调用会阻塞事件循环
+        response = await asyncio.to_thread(
+            dashscope.TextReRank.call,
             api_key=settings.DASHSCOPE_API_KEY,
             model="qwen3-rerank",
             query=query,

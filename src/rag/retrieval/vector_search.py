@@ -1,3 +1,5 @@
+import asyncio
+
 from pymilvus import MilvusClient
 
 
@@ -9,7 +11,9 @@ async def vector_search(
     filters: dict | None = None,
 ) -> list[dict]:
     filter_expr = _build_filter(filters) if filters else ""
-    results = milvus.search(
+    # pymilvus 是同步客户端，放线程池避免阻塞事件循环
+    results = await asyncio.to_thread(
+        milvus.search,
         collection_name=collection_name,
         data=[embedding],
         limit=top_k,

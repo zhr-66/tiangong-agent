@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from loguru import logger
 from langchain_core.messages import SystemMessage
-from src.agents.llm_utils import ainvoke_with_timeout
+from src.agents.llm_utils import agenerate_final, ainvoke_with_timeout
 from langchain_core.language_models import BaseChatModel
 from neo4j import AsyncDriver
 
@@ -110,5 +110,6 @@ async def search_graph(
     prompt = GRAPH_QA_PROMPT.format(
         question=answer_question, graph_result=graph_result, role=role,
     )
-    response = await ainvoke_with_timeout(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
+    # 最终面向用户的生成：流式接口下逐 token 推送
+    response = await agenerate_final(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content

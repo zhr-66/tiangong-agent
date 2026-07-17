@@ -7,6 +7,8 @@ Reranker 精排模块。
 """
 
 from __future__ import annotations
+import asyncio
+
 from loguru import logger
 
 from src.core.config import get_settings
@@ -37,7 +39,9 @@ async def rerank_docs(
         dashscope.api_key = settings.DASHSCOPE_API_KEY
 
         texts = [doc.get("text", "") for doc in documents]
-        response = TextReRank.call(
+        # TextReRank.call 是同步 HTTP 调用，直接调用会阻塞事件循环
+        response = await asyncio.to_thread(
+            TextReRank.call,
             model="qwen3-rerank",
             query=query,
             documents=texts,

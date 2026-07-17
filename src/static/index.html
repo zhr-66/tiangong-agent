@@ -534,6 +534,11 @@ async function sendMessage() {
             contentEl.innerHTML = markedToHtml(aiReply);
             contentEl.classList.add('cursor');
             scrollToBottom();
+          } else if (data.type === 'replace') {
+            // 权威全文对账：整体替换已流式显示的内容
+            aiReply = data.content;
+            contentEl.innerHTML = markedToHtml(aiReply);
+            scrollToBottom();
           } else if (data.type === 'done') {
             // 流结束
           } else if (data.type === 'error') {

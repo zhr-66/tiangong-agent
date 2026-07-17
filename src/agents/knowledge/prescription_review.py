@@ -19,6 +19,7 @@ from langchain_core.embeddings import Embeddings
 from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
+from src.agents.llm_utils import agenerate_final
 from src.agents.knowledge.prompts import (
     PRESCRIPTION_PARSE_PROMPT, PRESCRIPTION_REPORT_PROMPT,
 )
@@ -196,5 +197,6 @@ async def review_prescription(
     prompt = PRESCRIPTION_REPORT_PROMPT.format(
         prescription=prescription_str, check_results=results_str,
     )
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    # 最终面向用户的生成：流式接口下逐 token 推送
+    response = await agenerate_final(llm, [SystemMessage(content=prompt)], step="knowledge.llm")
     return response.content

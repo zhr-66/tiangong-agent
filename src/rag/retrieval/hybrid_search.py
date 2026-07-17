@@ -2,6 +2,8 @@
 Dense (向量) + Sparse (BM25) 混合检索，RRF 融合。
 需要集合中有 sparse_embedding 字段 (Milvus 2.6 内置 BM25)。
 """
+import asyncio
+
 from pymilvus import MilvusClient, AnnSearchRequest, RRFRanker
 
 
@@ -30,7 +32,9 @@ async def hybrid_search(
         expr=filter_expr,
     )
 
-    results = milvus.hybrid_search(
+    # pymilvus 是同步客户端，放线程池避免阻塞事件循环
+    results = await asyncio.to_thread(
+        milvus.hybrid_search,
         collection_name=collection_name,
         reqs=[dense_req, sparse_req],
         ranker=RRFRanker(k=60),
