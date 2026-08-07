@@ -5,6 +5,7 @@ import pytest
 
 from src.agents.knowledge.tools import KnowledgeDeps, _sql_session, build_knowledge_tools
 from src.agents.workers import knowledge_agent
+from src.agents.workers import drug_agent, operation_agent
 
 
 @pytest.fixture
@@ -137,3 +138,66 @@ async def test_query_builds_agent_with_current_request_context(monkeypatch):
     assert created_deps[0].user_id == "u1"
     assert created_deps[0].role == "doctor"
     assert created_deps[0].db_session == "db"
+
+
+def test_drug_agent_only_exposes_approved_tools(monkeypatch):
+    captured = {}
+    all_tool_names = [
+        "search_knowledge_docs",
+        "search_knowledge_graph",
+        "search_knowledge_sql",
+        "search_knowledge_multi",
+        "review_prescription_tool",
+        "future_internal_tool",
+    ]
+    monkeypatch.setattr(drug_agent, "get_llm", lambda temperature: object())
+    monkeypatch.setattr(drug_agent, "get_neo4j_driver", lambda: object())
+    monkeypatch.setattr(drug_agent, "get_milvus_client_alias", lambda: None)
+    monkeypatch.setattr(drug_agent, "DashScopeEmbeddings", lambda **kwargs: object())
+    monkeypatch.setattr(drug_agent, "MilvusClient", lambda **kwargs: object())
+    monkeypatch.setattr(
+        drug_agent,
+        "create_agent",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        drug_agent,
+        "build_knowledge_tools",
+        lambda deps: [SimpleNamespace(name=name) for name in all_tool_names],
+    )
+
+    drug_agent.create_drug_agent()
+
+    assert {tool.name for tool in captured["tools"]} == {
+        "search_knowledge_docs",
+        "search_knowledge_graph",
+        "search_knowledge_multi",
+        "review_prescription_tool",
+    }
+
+
+def test_operation_agent_only_exposes_sql_tool_without_request_session(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(operation_agent, "get_llm", lambda temperature: object())
+    monkeypatch.setattr(operation_agent, "get_neo4j_driver", lambda: object())
+    monkeypatch.setattr(operation_agent, "get_milvus_client_alias", lambda: None)
+    monkeypatch.setattr(operation_agent, "DashScopeEmbeddings", lambda **kwargs: object())
+    monkeypatch.setattr(operation_agent, "MilvusClient", lambda **kwargs: object())
+    monkeypatch.setattr(
+        operation_agent,
+        "create_agent",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        operation_agent,
+        "build_knowledge_tools",
+        lambda deps: [
+            SimpleNamespace(name="search_knowledge_docs"),
+            SimpleNamespace(name="search_knowledge_sql"),
+            SimpleNamespace(name="future_internal_tool"),
+        ],
+    )
+
+    operation_agent.create_operation_agent()
+
+    assert [tool.name for tool in captured["tools"]] == ["search_knowledge_sql"]

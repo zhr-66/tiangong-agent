@@ -58,9 +58,16 @@ def create_drug_agent():
         milvus_client=milvus_client,
         neo4j_driver=neo4j_driver,
     )
-    # 排除 NL2SQL 工具，药物咨询不需要运营数据
-    knowledge_tools = build_knowledge_tools(deps)
-    tools = [t for t in knowledge_tools if t.name != "search_knowledge_sql"]
+    allowed_tool_names = {
+        "search_knowledge_docs",
+        "search_knowledge_graph",
+        "search_knowledge_multi",
+        "review_prescription_tool",
+    }
+    tools = [
+        tool for tool in build_knowledge_tools(deps)
+        if tool.name in allowed_tool_names
+    ]
 
     return create_agent(
         model=llm,
