@@ -1,122 +1,105 @@
 from __future__ import annotations
-import asyncio
-import json
-from loguru import logger
+
+from langchain.agents import create_agent
 from langchain_community.embeddings import DashScopeEmbeddings
 from pymilvus import MilvusClient
-from langchain_core.messages import SystemMessage
-from src.agents.llm_utils import ainvoke_with_timeout
 
-from src.core.config import get_settings
-from src.infra.redis_cache import get_redis_client
-from src.agents.knowledge import (
-    rewrite_query, ROUTE_PROMPT,
-    search_docs, search_graph, search_sql,
-    multi_channel_search, review_prescription,
-    QueryAuditLog, Timer,
-    load_conversation_context, format_context, append_turn,
+from src.agents.knowledge.audit import QueryAuditLog, Timer
+from src.agents.knowledge.conversation import (
+    append_turn,
+    format_context,
+    load_conversation_context,
 )
+from src.agents.knowledge.tools import KnowledgeDeps, build_knowledge_tools
+from src.core.config import get_llm, get_settings
+from src.infra.redis_cache import get_redis_client
 
 settings = get_settings()
 
 
-def _looks_like_no_context_answer(answer: str) -> bool:
-    return "未找到" in answer or "not found" in answer.lower()
+KNOWLEDGE_SYSTEM_PROMPT = """你是天宫医疗的知识问答助手，面向患者、医生、药师和企业内部员工提供专业知识服务。
+
+## 你的工具
+
+- search_knowledge_docs：查询临床指南、药品说明书、医院制度和医学文献。
+- search_knowledge_graph：查询疾病、症状、药物、科室和检查之间的关系。
+- search_knowledge_sql：查询问诊量、库存、排名和趋势等运营统计数据。
+- search_knowledge_multi：融合文档和知识图谱，适合需要多个来源的复杂问题。
+- review_prescription_tool：审核处方的剂量、配伍禁忌、过敏冲突和重复用药。
+
+## 工具选择策略
+
+1. 处方审核、配伍禁忌、过敏冲突或用药安全校验，必须调用 review_prescription_tool。
+2. 指南、说明书、病因、预防或治疗原则，调用 search_knowledge_docs。
+3. 疾病与症状、药物、科室或检查的关系，调用 search_knowledge_graph。
+4. 统计、数量、排名、趋势或库存，调用 search_knowledge_sql。
+5. 同时需要文档依据与图谱关系，或无法确定单一来源时，优先调用 search_knowledge_multi。
+
+## 工作原则
+
+- 医学或运营事实必须先调用合适的工具获得证据，再回答用户。
+- 只基于工具返回的结果回答；证据不足时明确说明。
+- 涉及用药安全时提醒用户遵医嘱，并建议向医生或药师确认。
+- 不要向用户暴露工具、数据库或内部工作流细节。
+"""
+
+
+def _message_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def create_knowledge_agent(deps: KnowledgeDeps):
+    """Build a request-scoped Tool Calling Agent bound to the current user context."""
+    return create_agent(
+        model=deps.llm,
+        tools=build_knowledge_tools(deps),
+        system_prompt=KNOWLEDGE_SYSTEM_PROMPT,
+        name="knowledge_agent",
+    )
 
 
 class KnowledgeAgent:
+    """Reusable service that assembles context-bound knowledge tools per request."""
+
     def __init__(self):
         self.llm = None
         self.embedding_model = None
         self.milvus_client = None
         self.neo4j_driver = None
-        self._docs_collection_available: bool | None = None
         self._initialized = False
 
     async def initialize(self):
         if self._initialized:
             return
 
-        try:
-            self.llm = await self._get_llm()
-            self.embedding_model = DashScopeEmbeddings(
-                model=settings.EMBEDDING_MODEL,
-                dashscope_api_key=settings.DASHSCOPE_API_KEY,
-            )
-            self.milvus_client = MilvusClient(
-                uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
-            )
-            self._initialized = True
-            logger.info("KnowledgeAgent initialized")
-        except Exception as e:
-            logger.error(f"KnowledgeAgent initialization failed: {e}")
-            raise
-
-    async def _get_llm(self):
-        from src.core.config import get_llm
-        return get_llm(temperature=0.3)
+        self.llm = get_llm(temperature=0.3)
+        self.embedding_model = DashScopeEmbeddings(
+            model=settings.EMBEDDING_MODEL,
+            dashscope_api_key=settings.DASHSCOPE_API_KEY,
+        )
+        self.milvus_client = MilvusClient(
+            uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
+        )
+        self._initialized = True
 
     async def _get_neo4j_driver(self):
         if self.neo4j_driver is None:
             from src.infra.neo4j_client import get_neo4j_driver
+
             self.neo4j_driver = get_neo4j_driver()
         return self.neo4j_driver
-
-    async def _route_query(self, question: str) -> dict:
-        prompt = ROUTE_PROMPT.format(question=question)
-        try:
-            response = await ainvoke_with_timeout(
-                self.llm,
-                [SystemMessage(content=prompt)],
-                step="knowledge.route_query",
-            )
-            content = response.content.strip()
-            if "```" in content:
-                content = content.split("```")[1].lstrip("json").strip()
-            result = json.loads(content)
-            return result
-        except Exception as e:
-            logger.warning(f"Knowledge route failed: {e}")
-            return {"route": "multi", "reason": "route failed, fallback to multi"}
-
-    async def _get_db_session(self):
-        from src.infra.database import get_db
-
-        async for db in get_db():
-            return db
-
-    def _has_docs_collection(self) -> bool:
-        if self._docs_collection_available is not None:
-            return self._docs_collection_available
-        try:
-            from src.agents.knowledge.doc_rag import COLLECTION_NAME
-
-            self._docs_collection_available = self.milvus_client.has_collection(COLLECTION_NAME)
-        except Exception as e:
-            logger.warning("Knowledge docs collection check failed: {}", e)
-            self._docs_collection_available = False
-        return self._docs_collection_available
-
-    async def _search_docs_with_graph_fallback(self, question: str, role: str, context_text: str = "") -> tuple[str, list[str]]:
-        if not self._has_docs_collection():
-            logger.info("Knowledge docs collection is unavailable; using GraphRAG directly")
-            neo4j_driver = await self._get_neo4j_driver()
-            return await search_graph(question, neo4j_driver, self.llm, role, context_text=context_text), ["graph_rag"]
-
-        answer = await search_docs(
-            question, self.embedding_model, self.milvus_client,
-            self.llm, role=role, use_hyde=True, context_text=context_text,
-        )
-        channels = ["doc_rag"]
-
-        if _looks_like_no_context_answer(answer):
-            logger.info("DocRAG returned no context; fallback to GraphRAG")
-            neo4j_driver = await self._get_neo4j_driver()
-            graph_answer = await search_graph(question, neo4j_driver, self.llm, role, context_text=context_text)
-            if not _looks_like_no_context_answer(graph_answer):
-                return graph_answer, ["doc_rag", "graph_rag"]
-
-        return answer, channels
 
     async def query(
         self,
@@ -129,96 +112,56 @@ class KnowledgeAgent:
         if not self._initialized:
             await self.initialize()
 
+        redis_client = await get_redis_client()
+        history = await load_conversation_context(redis_client, user_id, session_id)
+        context_text = format_context(history)
+        agent_input = (
+            f"{context_text}\n\n当前问题：{question}"
+            if context_text
+            else question
+        )
+
+        deps = KnowledgeDeps(
+            llm=self.llm,
+            embedding_model=self.embedding_model,
+            milvus_client=self.milvus_client,
+            neo4j_driver=await self._get_neo4j_driver(),
+            db_session=db_session,
+            user_id=user_id or "anonymous",
+            role=role,
+        )
+        agent = create_knowledge_agent(deps)
+
         with Timer() as timer:
-            # 加载多轮对话上下文
-            redis_client = await get_redis_client()
-            history = await load_conversation_context(redis_client, user_id, session_id)
-            context_text = format_context(history)
-
-            # 有历史上下文时，用上下文增强问题做改写（让 LLM 解析指代："这两种药"→具体药名）
-            if context_text:
-                rewrite_input = f"{context_text}\n\n当前问题：{question}"
-            else:
-                rewrite_input = question
-
-            # 改写：解析指代、补全省略，输出具体可检索的问题
-            rewrite_result = await rewrite_query(rewrite_input, self.llm, role)
-            queries = rewrite_result.get("queries", [question])
-            rewritten = queries[0] if queries else question
-            intent = rewrite_result.get("intent", "knowledge_qa")
-
-            # 路由用原始问题（改写可能拆分成多个子查询，只用第一个会丢失意图）
-            # 但如果有上下文改写（解析指代），用 rewrite_input 更准确
-            route_input = rewrite_input if context_text else question
-            route_result = await self._route_query(route_input)
-            route = route_result.get("route", "doc_rag")
-
-            # 最终 LLM 生成回答时用含上下文的问题
-            answer_question = rewrite_input if context_text else question
-
-            logger.info(
-                "Knowledge query | question={} | rewritten={} | route={} | intent={}",
-                question[:60], rewritten[:60], route, intent,
+            result = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": agent_input}]}
             )
 
-            if route == "prescription":
-                neo4j_driver = await self._get_neo4j_driver()
-                answer = await review_prescription(
-                    answer_question, self.llm, self.embedding_model,
-                    self.milvus_client, neo4j_driver,
-                )
-                channels = ["prescription"]
+        messages = result.get("messages") or []
+        answer = _message_content(messages[-1].content).strip() if messages else ""
+        if not answer:
+            answer = "暂时未能生成有效回答，请稍后重试。"
 
-            elif route == "graph_rag":
-                neo4j_driver = await self._get_neo4j_driver()
-                answer = await search_graph(rewritten, neo4j_driver, self.llm, role, context_text=answer_question)
-                channels = ["graph_rag"]
+        if user_id and session_id:
+            await append_turn(redis_client, user_id, session_id, question, answer)
 
-            elif route == "nl2sql":
-                if db_session is None:
-                    db_session = await self._get_db_session()
-                answer = await search_sql(rewritten, self.llm, db_session)
-                channels = ["nl2sql"]
-
-            elif route == "multi":
-                neo4j_driver = await self._get_neo4j_driver()
-                if db_session is None:
-                    db_session = await self._get_db_session()
-                answer, channels = await multi_channel_search(    # 多通道检索
-                    rewritten, self.llm, self.embedding_model,
-                    self.milvus_client, neo4j_driver, db_session,
-                    channels=["doc_rag", "graph_rag"],
-                    role=role,
-                    context_text=answer_question,
-                    sub_queries=queries if len(queries) > 1 else None,
-                )
-
-            else:
-                answer, channels = await self._search_docs_with_graph_fallback(rewritten, role, context_text=answer_question)
-
-            # 保存本轮对话到上下文
-            if user_id and session_id:
-                await append_turn(redis_client, user_id, session_id, question, answer)
-
-            QueryAuditLog.log(
-                user_id=user_id,
-                role=role,
-                question=question,
-                intent=intent,
-                channels=channels,
-                answer_preview=answer,
-                duration_ms=timer.elapsed_ms,
-            )
-
+        QueryAuditLog.log(
+            user_id=user_id or "anonymous",
+            role=role,
+            question=question,
+            intent="tool_calling",
+            channels=[],
+            answer_preview=answer,
+            duration_ms=timer.elapsed_ms,
+        )
         return answer
 
 
-_knowledge_agent = None
+_knowledge_agent: KnowledgeAgent | None = None
 
 
 async def get_knowledge_agent() -> KnowledgeAgent:
     global _knowledge_agent
     if _knowledge_agent is None:
         _knowledge_agent = KnowledgeAgent()
-        await _knowledge_agent.initialize()
     return _knowledge_agent
