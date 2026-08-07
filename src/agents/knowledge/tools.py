@@ -11,6 +11,10 @@
 """
 
 from __future__ import annotations
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import AsyncContextManager
+
 from langchain_core.tools import tool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
@@ -19,6 +23,7 @@ from pymilvus import MilvusClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.knowledge.audit import QueryAuditLog, Timer
+from src.infra.database import AsyncSessionLocal
 
 
 class KnowledgeDeps:
@@ -32,6 +37,7 @@ class KnowledgeDeps:
         db_session: AsyncSession | None = None,
         user_id: str = "anonymous",
         role: str = "patient",
+        session_factory: Callable[[], AsyncContextManager[AsyncSession]] | None = None,
     ):
         self.llm = llm
         self.embedding_model = embedding_model
@@ -40,6 +46,19 @@ class KnowledgeDeps:
         self.db_session = db_session
         self.user_id = user_id
         self.role = role
+        self.session_factory = session_factory
+
+
+@asynccontextmanager
+async def _sql_session(deps: KnowledgeDeps) -> AsyncIterator[AsyncSession]:
+    """Reuse the request session or open a short-lived session for this tool call."""
+    if deps.db_session is not None:
+        yield deps.db_session
+        return
+
+    session_factory = deps.session_factory or AsyncSessionLocal
+    async with session_factory() as session:
+        yield session
 
 
 async def _rewrite(question: str, deps: KnowledgeDeps) -> str:
@@ -95,11 +114,10 @@ def build_knowledge_tools(deps: KnowledgeDeps) -> list:
         """从运营数据库中查询统计数据并生成回答。
         适用：查询问诊量、药品库存、科室排名、收入统计等结构化数据。
         question: 用户的问题"""
-        if deps.db_session is None:
-            return "数据库连接不可用，无法执行查询。"
         from src.agents.knowledge.nl2sql import search_sql
         with Timer() as t:
-            result = await search_sql(question=question, llm=deps.llm, db=deps.db_session)
+            async with _sql_session(deps) as session:
+                result = await search_sql(question=question, llm=deps.llm, db=session)
         QueryAuditLog.log(
             deps.user_id, deps.role, question, "nl2sql",
             ["nl2sql"], result[:80], t.elapsed_ms,
@@ -115,7 +133,7 @@ def build_knowledge_tools(deps: KnowledgeDeps) -> list:
         from src.agents.knowledge.fusion import multi_channel_search
         rewritten = await _rewrite(question, deps)
         with Timer() as t:
-            result = await multi_channel_search(
+            answer, channels = await multi_channel_search(
                 question=rewritten, llm=deps.llm,
                 embedding_model=deps.embedding_model,
                 milvus_client=deps.milvus_client,
@@ -125,9 +143,9 @@ def build_knowledge_tools(deps: KnowledgeDeps) -> list:
             )
         QueryAuditLog.log(
             deps.user_id, deps.role, question, "multi",
-            ["doc_rag", "graph_rag"], result[:80], t.elapsed_ms,
+            channels, answer[:80], t.elapsed_ms,
         )
-        return result
+        return answer
 
     @tool
     async def review_prescription_tool(question: str) -> str:
