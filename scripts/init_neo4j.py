@@ -42,6 +42,44 @@ def load_medical_data(filepath: Path) -> list[dict]:
     logger.info(f"加载了 {len(data)} 条疾病记录")
     return data
 
+def compute_symptom_stats(driver) -> None:
+    """
+    预计算每个症状的 df（患有该症状的疾病数），写入 Symptom.df 属性。
+    供问诊置信度的 IDF 加权打分使用（idf(s) = log(N / df(s))，N 为疾病总数）。
+    图谱数据变更后需重新执行；幂等，可单独运行：
+        python scripts/init_neo4j.py --stats-only
+    """
+    logger.info("计算症状 df 统计（IDF 权重用）...")
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (s:Symptom)<-[:HAS_SYMPTOM]-(d:Disease)
+            WITH s, count(DISTINCT d) AS df
+            SET s.df = df
+            RETURN count(s) AS updated
+            """
+        )
+        updated = result.single()["updated"]
+        # 无疾病关联的孤立症状 df 置 0（idf 计算时安全降级为零权重）
+        session.run(
+            "MATCH (s:Symptom) WHERE s.df IS NULL SET s.df = 0"
+        )
+    logger.info(f"症状 df 统计完成，共更新 {updated} 个症状节点")
+
+
+def stats_only():
+    """只更新症状统计，不重建图谱（供已有图谱升级用）。"""
+    from neo4j import GraphDatabase
+
+    settings = get_settings()
+    driver = GraphDatabase.driver(
+        settings.NEO4J_URI,
+        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+    )
+    compute_symptom_stats(driver)
+    driver.close()
+
+
 def init_graph():
     from neo4j import GraphDatabase
     from tqdm import tqdm
@@ -274,6 +312,9 @@ def init_graph():
                     **params,
                 )
 
+    # --- 9.5. 预计算症状 df 统计（IDF 权重用） ---
+    compute_symptom_stats(driver)
+
     # --- 10. 输出统计 ---
     total_nodes = sum(len(v) for v in entities.values())
     total_rels  = sum(len(v) for v in relation_pairs.values())
@@ -293,4 +334,7 @@ def init_graph():
     driver.close()
 
 if __name__ == "__main__":
-    init_graph()
+    if "--stats-only" in sys.argv:
+        stats_only()
+    else:
+        init_graph()

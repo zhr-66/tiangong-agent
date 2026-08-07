@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-v3"
     VL_MODEL: str = "qwen-vl"
 
+    # 问诊置信度打分
+    # 打分模式：idf_f1（IDF 加权双向 F1）| legacy（命中数/总症状数）
+    INQUIRY_SCORING: str = "idf_f1"
+    # 否认惩罚系数 β（仅 idf_f1 模式）：惩罚 = -β · Σ被否认症状归一化权重
+    INQUIRY_DENIAL_BETA: float = 0.6
+    # 收敛阈值（随打分模式校准，见 scripts/eval_confidence.py）
+    # idf_f1 模式校准结果（medical.json 离线模拟，200/500 样本双种子验证）：
+    #   (0.70, 0.25) 终轮Top1 84~88%、平均 ~5 轮；legacy 同阈值下仅 69%
+    INQUIRY_TOP1_THRESHOLD: float = 0.70
+    INQUIRY_GAP_THRESHOLD: float = 0.25
+
     LOG_LEVEL: str = "DEBUG"
     LOG_DIR: str = "logs"
 

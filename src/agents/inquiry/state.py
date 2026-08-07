@@ -23,9 +23,12 @@ class InquiryPhase(str, Enum):
 class CandidateDisease(BaseModel):
     name: str
     confidence: float = 0.0           # 最终置信度（加权后）
-    base_confidence: float = 0.0      # 基础置信度 = 命中症状数 / 总症状数
+    base_confidence: float = 0.0      # 基础置信度（打分模式见 INQUIRY_SCORING 配置）
     matched_symptoms: list[str] = Field(default_factory=list)
     all_symptoms: list[str] = Field(default_factory=list)
+    # 该病各症状的归一化 IDF 权重（idf_f1 模式；legacy 模式为空 dict）
+    # 用于否认惩罚分级与追问排序
+    symptom_weights: dict[str, float] = Field(default_factory=dict)
     department: str = ""
     checks: list[str] = Field(default_factory=list)
     complications: list[str] = Field(default_factory=list)  # ACOMPANY_WITH 关系

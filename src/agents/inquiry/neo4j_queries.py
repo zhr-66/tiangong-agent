@@ -3,7 +3,14 @@
 from __future__ import annotations
 from loguru import logger
 from neo4j import AsyncDriver
+
+from src.core.config import get_settings
+from src.agents.inquiry.scoring import score_candidates
 from src.agents.inquiry.state import CandidateDisease
+
+# Cypher 粗召回上限：先按命中数取前 N 个候选，再由 Python 侧精确打分排序。
+# 用户症状通常 2~5 个，共享任一症状的疾病可能上百，50 足够覆盖真实候选。
+_RECALL_LIMIT = 50
 
 
 async def query_candidate_diseases(
@@ -13,49 +20,88 @@ async def query_candidate_diseases(
 ) -> list[CandidateDisease]:
     """
     根据已确认症状列表，从 Neo4j 查询候选疾病。
-    按基础置信度（命中症状数 / 该疾病总症状数）降序排列，取 Top K。
+
+    分两步：
+    1. Cypher 粗召回：取共享症状最多的前 _RECALL_LIMIT 个疾病及其症状/df 数据
+    2. Python 精排：scoring.score_candidates 按 INQUIRY_SCORING 配置打分
+       （idf_f1 = IDF 加权双向 F1；legacy = 命中数/总症状数）
+    打分逻辑与离线评估台（scripts/eval_confidence.py）共用同一实现。
     """
     if not confirmed_symptoms:
         return []
 
     cypher = """
+    MATCH (n:Disease) WITH count(n) AS n_diseases
     MATCH (d:Disease)-[:HAS_SYMPTOM]->(s:Symptom)
     WHERE s.name IN $confirmed_symptoms
-    WITH d, collect(s.name) AS matched_symptoms, count(s) AS matched_count
+    WITH n_diseases, d, collect(s.name) AS matched_symptoms, count(s) AS matched_count
+    ORDER BY matched_count DESC
+    LIMIT $recall_limit
     MATCH (d)-[:HAS_SYMPTOM]->(all_s:Symptom)
-    WITH d, matched_symptoms, matched_count, count(all_s) AS total_symptoms
-    ORDER BY toFloat(matched_count) / total_symptoms DESC
-    LIMIT $top_k
     RETURN
+        n_diseases,
         d.name AS disease,
         matched_symptoms,
-        matched_count,
-        total_symptoms,
-        toFloat(matched_count) / total_symptoms AS base_confidence
+        collect(all_s.name) AS all_symptoms,
+        collect({name: all_s.name, df: all_s.df}) AS symptom_dfs
     """
 
     async with neo4j_driver.session() as session:
         result = await session.run(
             cypher,
             confirmed_symptoms=confirmed_symptoms,
-            top_k=top_k,
+            recall_limit=_RECALL_LIMIT,
         )
         records = await result.data()
 
-    candidates = []
+    if not records:
+        return []
+
+    n_diseases = records[0]["n_diseases"]
+
+    # 汇总本次涉及症状的 df 表（df 为 None 表示统计未跑，scoring 会安全回退 legacy）
+    symptom_df: dict[str, int] = {}
     for r in records:
-        candidates.append(CandidateDisease(
-            name=r["disease"],
-            base_confidence=round(r["base_confidence"], 4),
-            confidence=round(r["base_confidence"], 4),  # 初始值，后续加权调整
-            matched_symptoms=r["matched_symptoms"],
-            all_symptoms=[],   # 由 enrich_candidate_details 补充
+        for item in r["symptom_dfs"]:
+            if item["df"] is not None:
+                symptom_df[item["name"]] = item["df"]
+
+    settings = get_settings()
+    if settings.INQUIRY_SCORING == "idf_f1" and not symptom_df:
+        logger.warning(
+            "Symptom.df 统计缺失，回退 legacy 打分。"
+            "请执行: python scripts/init_neo4j.py --stats-only"
+        )
+
+    raw = [
+        {
+            "name": r["disease"],
+            "matched_symptoms": r["matched_symptoms"],
+            "all_symptoms": r["all_symptoms"],
+        }
+        for r in records
+    ]
+    scored = score_candidates(
+        raw, confirmed_symptoms, symptom_df, n_diseases,
+        mode=settings.INQUIRY_SCORING, top_k=top_k,
+    )
+
+    candidates = [
+        CandidateDisease(
+            name=s.name,
+            base_confidence=s.base_confidence,
+            confidence=s.base_confidence,   # 初始值，后续 apply_context_weights 调整
+            matched_symptoms=s.matched_symptoms,
+            all_symptoms=s.all_symptoms,    # 打分查询已带回，enrich 不再重复查
+            symptom_weights=s.symptom_weights,
             department="",
             checks=[],
             complications=[],
-        ))
+        )
+        for s in scored
+    ]
 
-    logger.debug(f"Neo4j 候选疾病: {[c.name for c in candidates]}")
+    logger.debug(f"Neo4j 候选疾病: {[(c.name, c.base_confidence) for c in candidates]}")
     return candidates
 
 
@@ -131,11 +177,20 @@ async def get_pending_symptoms(
     """
     already_known = set(confirmed_symptoms) | set(denied_symptoms) | set(asked_symptoms)
     symptom_count: dict[str, int] = {}
+    symptom_weight: dict[str, float] = {}
     for c in candidates:
         for s in c.all_symptoms:
             if s not in already_known:
                 symptom_count[s] = symptom_count.get(s, 0) + 1
+                # 取该症状在各候选疾病中的最大归一化 IDF 权重（legacy 模式恒为 0）
+                w = c.symptom_weights.get(s, 0.0)
+                if w > symptom_weight.get(s, 0.0):
+                    symptom_weight[s] = w
 
-    # 区分度高（出现次数少）的排前面
-    sorted_symptoms = sorted(symptom_count.items(), key=lambda x: x[1])
+    # 主排序：出现在越少候选疾病中越优先（区分候选的能力强）
+    # 次排序：IDF 权重越高越优先（确认/否认后对置信度影响大）
+    sorted_symptoms = sorted(
+        symptom_count.items(),
+        key=lambda x: (x[1], -symptom_weight.get(x[0], 0.0)),
+    )
     return sorted_symptoms

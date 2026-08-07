@@ -235,3 +235,11 @@ xxhash==3.6.0
 yarl==1.23.0
 zipp==3.23.0
 zstandard==0.25.0
+# TruLens 评估（src/rag/evaluation、src/agents/knowledge/evaluation 依赖）
+litellm==1.91.0
+trulens==2.8.1
+trulens-core==2.8.1
+trulens-dashboard==2.8.1
+trulens-feedback==2.8.1
+trulens-otel-semconv==2.8.1
+trulens-providers-litellm==2.8.1

@@ -51,6 +51,12 @@ SAFE_INQUIRY_FALLBACK = (
 
 
 
+# \u2500\u2500 API \u5c42\u5feb\u901f\u5206\u6d41 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# \u539f\u5219\uff1a\u5feb\u901f\u901a\u9053\u53ea\u5904\u7406"\u9ad8\u7f6e\u4fe1\u72ec\u5360\u547d\u4e2d"\uff0c\u4e3a\u5e38\u89c1\u8bf7\u6c42\u7701\u4e00\u8df3 Supervisor LLM \u8c03\u7528\uff1b
+# \u540c\u65f6\u547d\u4e2d\u4e24\u7c7b\u6216\u90fd\u4e0d\u547d\u4e2d\u7684\u6b67\u4e49\u6d88\u606f\uff0c\u4e00\u5f8b\u4ea4 Supervisor \u7531 LLM \u7ed3\u5408\u4e0a\u4e0b\u6587\u8def\u7531\u3002
+# \u5173\u952e\u8bcd\u6309"\u7cbe\u786e\u7387\u4f18\u5148"\u6311\u9009\u2014\u2014\u5feb\u901f\u901a\u9053\u7701\u4e0b\u7684\u5ef6\u8fdf\u53ea\u6709\u5728\u4e0d\u51fa\u9519\u65f6\u624d\u6709\u4ef7\u503c\u3002
+
+# \u95ee\u8bca\u4fe1\u53f7\uff1a\u75c7\u72b6\u63cf\u8ff0\u3001\u5c31\u8bca/\u79d1\u5ba4\u5f15\u5bfc
 INQUIRY_HINTS = (
     "\u5934\u75bc", "\u5934\u75db", "\u53d1\u70e7", "\u53d1\u70ed", "\u54b3\u55fd",
     "\u80f8\u95f7", "\u80f8\u75db", "\u547c\u5438\u56f0\u96be", "\u809a\u5b50\u75bc",
@@ -59,9 +65,10 @@ INQUIRY_HINTS = (
     "\u5c31\u8bca",
 )
 
+# \u77e5\u8bc6\u95ee\u7b54\u4fe1\u53f7\uff1a\u75be\u75c5/\u836f\u54c1\u77e5\u8bc6\u7684\u7591\u95ee\u53e5\u5f0f
 KNOWLEDGE_HINTS = (
     "\u662f\u4ec0\u4e48", "\u6709\u54ea\u4e9b", "\u7c7b\u578b", "\u539f\u56e0",
-    "\u600e\u4e48\u6cbb\u7597", "\u6cbb\u7597", "\u80fd\u6cbb\u597d\u5417",
+    "\u600e\u4e48\u6cbb\u7597", "\u5982\u4f55\u6cbb\u7597", "\u80fd\u6cbb\u597d\u5417",
     "\u6ce8\u610f\u4ec0\u4e48", "\u65e9\u671f\u75c7\u72b6", "\u5e76\u53d1\u75c7",
     "\u533a\u522b", "\u8bca\u65ad\u6807\u51c6", "\u9884\u9632",
     "\u5403\u4ec0\u4e48\u836f", "\u5403\u54ea\u79cd\u836f", "\u7528\u4ec0\u4e48\u836f",
@@ -69,12 +76,23 @@ KNOWLEDGE_HINTS = (
 )
 
 
-def _looks_like_inquiry(message: str) -> bool:
-    return any(hint in message for hint in INQUIRY_HINTS)
+def decide_fast_route(message: str) -> tuple[str, list[str]]:
+    """
+    API \u5c42\u5feb\u901f\u5206\u6d41\uff08\u7eaf\u51fd\u6570\uff0c\u4fbf\u4e8e\u79bb\u7ebf\u56de\u5f52\u6d4b\u8bd5\uff09\u3002
 
+    \u8fd4\u56de (\u8def\u7531, \u547d\u4e2d\u8bcd\u5217\u8868)\uff1a
+      "knowledge"  \u53ea\u547d\u4e2d\u77e5\u8bc6\u5173\u952e\u8bcd \u2192 \u76f4\u8fde\u77e5\u8bc6 Agent
+      "inquiry"    \u53ea\u547d\u4e2d\u95ee\u8bca\u5173\u952e\u8bcd \u2192 \u76f4\u8fde\u95ee\u8bca\u56fe
+      "supervisor" \u540c\u65f6\u547d\u4e2d\u6216\u90fd\u4e0d\u547d\u4e2d \u2192 \u4ea4 Supervisor LLM \u8def\u7531
+    """
+    inquiry_hits = [h for h in INQUIRY_HINTS if h in message]
+    knowledge_hits = [h for h in KNOWLEDGE_HINTS if h in message]
 
-def _looks_like_knowledge(message: str) -> bool:
-    return any(hint in message for hint in KNOWLEDGE_HINTS)
+    if knowledge_hits and not inquiry_hits:
+        return "knowledge", knowledge_hits
+    if inquiry_hits and not knowledge_hits:
+        return "inquiry", inquiry_hits
+    return "supervisor", inquiry_hits + knowledge_hits
 
 def _content_to_text(content) -> str:
     """Normalize LangChain message content to displayable plain text."""
@@ -243,10 +261,11 @@ async def chat(
             reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
             return ChatResponse(reply=reply, session_id=req.session_id)
 
-        # ── 无活跃问诊：走 Supervisor ──
-        # Fast path for common chat types; avoids an extra Supervisor LLM turn.
-        # 知识问答优先判断（"糖尿病有哪些症状"应走知识库，而非问诊）
-        if _looks_like_knowledge(req.message):
+        # ── 无活跃问诊：快速分流（独占命中直连；歧义/未命中走 Supervisor） ──
+        route, hits = decide_fast_route(req.message)
+        logger.info("chat 快速分流: route={} hits={} message={!r}", route, hits, req.message[:50])
+
+        if route == "knowledge":
             knowledge_agent = await get_knowledge_agent()
             reply = await knowledge_agent.query(
                 req.message,
@@ -256,7 +275,7 @@ async def chat(
             )
             return ChatResponse(reply=reply, session_id=req.session_id)
 
-        if _looks_like_inquiry(req.message):
+        if route == "inquiry":
             reply = await _run_inquiry_turn(req.message, thread_id, redis, db)
             return ChatResponse(reply=reply, session_id=req.session_id)
 
@@ -345,11 +364,19 @@ async def chat_stream(
             active_key = f"inquiry_active:{thread_id}"
 
             # 分支选择逻辑与非流式接口一致
-            if await redis.exists(active_key):
+            route = "inquiry_active" if await redis.exists(active_key) else None
+            if route is None:
+                route, hits = decide_fast_route(req.message)
+                logger.info(
+                    "chat/stream 快速分流: route={} hits={} message={!r}",
+                    route, hits, req.message[:50],
+                )
+
+            if route == "inquiry_active" or route == "inquiry":
                 def pipeline():
                     return _run_inquiry_turn(req.message, thread_id, redis, db)
 
-            elif _looks_like_knowledge(req.message):
+            elif route == "knowledge":
                 knowledge_agent = await get_knowledge_agent()
 
                 def pipeline():
@@ -359,10 +386,6 @@ async def chat_stream(
                         session_id=req.session_id,
                         db_session=db,
                     )
-
-            elif _looks_like_inquiry(req.message):
-                def pipeline():
-                    return _run_inquiry_turn(req.message, thread_id, redis, db)
 
             else:
                 # Supervisor 分支：Supervisor 自身的最终回复不逐 token 推送
